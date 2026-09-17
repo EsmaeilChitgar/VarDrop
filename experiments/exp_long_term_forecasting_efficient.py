@@ -140,10 +140,11 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
 
                 # VarDrop ----------------------------
                 sparse_indices = efficient_sampler(
-                    batch_x, 
-                    k=self.args.k, 
-                    group_size=self.args.group_size, 
-                    freq_list=range(1,25)
+                    batch_x,
+                    k=self.args.k,
+                    group_size=self.args.group_size,
+                    freq_list=range(1,25),
+                    sampling='importance'
                 )
                 sparse_indices = np.unique(sparse_indices)
 
