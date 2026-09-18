@@ -538,6 +538,216 @@ class CachedAdaptiveSampler:
 
 
 # ============================================================
+# Version 4
+# Random Fixed-Budget Sampling
+# ============================================================
+
+def random_sampler(
+    x,
+    target_tokens
+):
+    """
+    Uniform random sampling with a fixed global token budget.
+
+    Input:
+        x: [B, L, N]
+
+    Output:
+        sorted selected variate indices
+    """
+
+    N = x.shape[-1]
+
+    budget = min(
+        int(target_tokens),
+        N
+    )
+
+    if budget <= 0:
+        return []
+
+    indices = np.random.choice(
+        N,
+        size=budget,
+        replace=False
+    )
+
+    return np.sort(
+        indices
+    ).astype(
+        np.int64
+    ).tolist()
+
+
+# ============================================================
+# Version 5
+# Frequency-Grouped Fixed-Budget Random Sampling
+# ============================================================
+
+def efficient_sampler_freq_budget_random(
+    x,
+    k,
+    group_size,
+    freq_list,
+    target_tokens,
+    min_thres=None
+):
+    """
+    Frequency-aware fixed-budget random sampling.
+
+    1. Group variates using k-DFH.
+    2. Allocate one global token budget proportional
+       to group size.
+    3. Randomly sample from each frequency group.
+
+    This version intentionally does NOT use:
+        - temporal profiles
+        - temporal centroids
+        - dispersion
+        - heterogeneity-aware allocation
+
+    It is designed as a controlled baseline for V2.
+    """
+
+    hash_values = k_dominant_frequency_hashing(
+        x,
+        k,
+        freq_list,
+        min_thres
+    )
+
+    unique_groups = np.unique(
+        hash_values
+    )
+
+    groups = []
+
+    for value in unique_groups:
+
+        indices = np.where(
+            hash_values == value
+        )[0]
+
+        groups.append(
+            indices
+        )
+
+    N = len(hash_values)
+
+    budget = min(
+        int(target_tokens),
+        N
+    )
+
+    if budget <= 0:
+        return []
+
+    sizes = np.array(
+        [
+            len(group)
+            for group in groups
+        ],
+        dtype=np.int32
+    )
+
+    # --------------------------------------------------------
+    # Allocate global budget proportional to group size.
+    # --------------------------------------------------------
+
+    raw_allocation = (
+        budget *
+        sizes /
+        sizes.sum()
+    )
+
+    allocation = np.floor(
+        raw_allocation
+    ).astype(
+        np.int32
+    )
+
+    allocation = np.minimum(
+        allocation,
+        sizes
+    )
+
+    # --------------------------------------------------------
+    # Largest remainder correction
+    # --------------------------------------------------------
+
+    current = int(
+        allocation.sum()
+    )
+
+    remaining = budget - current
+
+    if remaining > 0:
+
+        fractional = (
+            raw_allocation -
+            np.floor(
+                raw_allocation
+            )
+        )
+
+        valid = np.where(
+            allocation < sizes
+        )[0]
+
+        order = valid[
+            np.argsort(
+                -fractional[valid]
+            )
+        ]
+
+        for index in order:
+
+            if remaining <= 0:
+                break
+
+            allocation[index] += 1
+            remaining -= 1
+
+    # --------------------------------------------------------
+    # Random sampling inside each group
+    # --------------------------------------------------------
+
+    sparse_indices = []
+
+    for group, n_select in zip(
+        groups,
+        allocation
+    ):
+
+        if n_select <= 0:
+            continue
+
+        if n_select >= len(group):
+
+            selected = group
+
+        else:
+
+            selected = np.random.choice(
+                group,
+                size=n_select,
+                replace=False
+            )
+
+        sparse_indices.extend(
+            selected.tolist()
+        )
+
+    return sorted(
+        list(
+            set(
+                sparse_indices
+            )
+        )
+    )
+
+
+# ============================================================
 # Unified sampler
 # ============================================================
 
@@ -559,6 +769,8 @@ def efficient_sampler(
         1 -> Temporal Representative Sampling
         2 -> Adaptive Token Budget
         3 -> Cached Adaptive Sampling
+        4 -> Random Fixed-Budget Sampling
+        5 -> Frequency-Grouped Fixed-Budget Random Sampling
 
     For version 3, pass the CachedAdaptiveSampler object
     through 'sampler'.
@@ -612,9 +824,39 @@ def efficient_sampler(
 
         return sampler(x)
 
+    elif version == 4:
+
+        if target_tokens is None:
+            raise ValueError(
+                "target_tokens is required for "
+                "VarDrop version 4."
+            )
+
+        return random_sampler(
+            x,
+            target_tokens=target_tokens
+        )
+
+    elif version == 5:
+
+        if target_tokens is None:
+            raise ValueError(
+                "target_tokens is required for "
+                "VarDrop version 5."
+            )
+
+        return efficient_sampler_freq_budget_random(
+            x,
+            k=k,
+            group_size=group_size,
+            freq_list=freq_list,
+            target_tokens=target_tokens,
+            min_thres=min_thres
+        )
+
     else:
 
         raise ValueError(
             f"Unknown VarDrop version: {version}. "
-            f"Use 0, 1, 2 or 3."
+            f"Use 0, 1, 2, 3, 4 or 5."
         )
