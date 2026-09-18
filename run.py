@@ -57,7 +57,7 @@ if __name__ == '__main__':
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
 
     # optimization
-    parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
+    parser.add_argument('--num_workers', type=int, default=1, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
@@ -90,6 +90,29 @@ if __name__ == '__main__':
     # RedAttention
     parser.add_argument('--k', type=int, required=False, help='number of dominant frequency for k-DFH' )
     parser.add_argument('--group_size', type=int, required=False)
+
+    parser.add_argument(
+        '--vardrop_version',
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3],
+        help='0: Original, 1: Temporal Representative, '
+             '2: Adaptive Budget, 3: Cached Adaptive'
+    )
+
+    parser.add_argument(
+        '--target_tokens',
+        type=int,
+        default=600,
+        help='Target number of variates for VarDrop v2/v3'
+    )
+
+    parser.add_argument(
+        '--sampler_refresh',
+        type=int,
+        default=64,
+        help='Refresh interval for VarDrop v3'
+    )
     
 
     args = parser.parse_args()
@@ -115,7 +138,7 @@ if __name__ == '__main__':
     if args.is_training:
         for ii in range(args.itr):
             # setting record of experiments
-            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_{}_{}'.format(
+            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_vd{}_tt{}_sr{}_{}_{}'.format(
                 args.model_id,
                 args.model,
                 args.data,
@@ -134,7 +157,12 @@ if __name__ == '__main__':
                 args.des,
                 args.k,
                 args.group_size,
-                args.class_strategy, ii)
+                args.vardrop_version,
+                args.target_tokens,
+                args.sampler_refresh,
+                args.class_strategy,
+                ii
+            )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -150,7 +178,7 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
     else:
         ii = 0
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_{}_{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_vd{}_tt{}_sr{}_{}_{}'.format(
             args.model_id,
             args.model,
             args.data,
@@ -169,7 +197,12 @@ if __name__ == '__main__':
             args.des,
             args.k,
             args.group_size,
-            args.class_strategy, ii)
+            args.vardrop_version,
+            args.target_tokens,
+            args.sampler_refresh,
+            args.class_strategy,
+            ii
+        )
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
