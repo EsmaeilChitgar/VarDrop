@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import time
 from itertools import chain
 
 
@@ -56,3 +57,182 @@ def efficient_sampler(x, k, group_size, freq_list, min_thres=None, return_group=
         return sample_indices, group_dict
 
     return sample_indices
+
+# ============================================================
+# GPT3b: Exact Fast k-DFH VarDrop
+# ============================================================
+
+def k_dominant_frequency_hashing_fast_exact(
+    batch_x,
+    k,
+    freq_list=None,
+    min_thres=None
+):
+    """
+    Exact k-DFH equivalent to k_dominant_frequency_hashing(), but avoids
+    repeatedly synchronizing GPU tensors through per-variate .tolist() calls.
+
+    IMPORTANT:
+        - FFT, mean spectrum, top-k, thresholding, string hash format,
+          group ordering, and random sampling semantics are unchanged.
+        - The only optimization is one batched device-to-CPU transfer of the
+          [k, n_vars] top-k frequency tensor before Python string construction.
+
+    Therefore, with the same input and RNG state, downstream groups and sampled
+    indices are expected to match original VarDrop exactly.
+    """
+    x_amp = torch.fft.rfft(batch_x, dim=1).abs()
+    x_amp = torch.mean(x_amp, dim=0)
+
+    if freq_list is not None:
+        freq_list = list(freq_list)
+        k_amps, k_freqs = torch.topk(x_amp[freq_list], k=k, dim=0)
+        # Preserve original VarDrop indexing semantics exactly.
+        k_freqs += freq_list[0]
+    else:
+        k_amps, k_freqs = torch.topk(x_amp, k=k, dim=0)
+
+    if min_thres is not None:
+        k_freqs = k_freqs * (k_amps >= min_thres)
+        k_freqs += (k_amps < min_thres) * 99
+
+    # Original hash_func() calls .tolist() once per variate on k_freqs.T.
+    # On CUDA that can induce many small synchronizations/transfers.
+    # GPT3b performs ONE synchronized transfer for the whole tensor.
+    k_freqs_cpu = (
+        k_freqs.detach()
+        .cpu()
+        .transpose(0, 1)
+        .contiguous()
+        .numpy()
+    )
+
+    # Keep the exact original string representation and np.unique ordering.
+    hash_values = np.array([
+        '-'.join(map(str, row.tolist()))
+        for row in k_freqs_cpu
+    ])
+
+    return hash_values
+
+
+def efficient_sampler_fast_exact(
+    x,
+    k,
+    group_size,
+    freq_list,
+    min_thres=None,
+    return_group=False
+):
+    """
+    Exact-behavior fast implementation of original VarDrop sampling.
+
+    This function intentionally preserves:
+        1. k-DFH definition,
+        2. string hash representation,
+        3. np.unique group ordering,
+        4. np.random.choice(..., replace=True),
+        5. sorted flattened output.
+
+    It changes only how the top-k frequency tensor is transferred from the
+    device before hash construction.
+    """
+    hash_values = k_dominant_frequency_hashing_fast_exact(
+        x,
+        k=k,
+        freq_list=freq_list,
+        min_thres=min_thres
+    )
+
+    sparse_indices = []
+
+    if return_group:
+        group_dict = {}
+
+    for value in np.unique(hash_values):
+        group_indices = np.where(hash_values == value)[0].tolist()
+        group_indices = np.random.choice(
+            group_indices,
+            min(group_size, len(group_indices)),
+            replace=True
+        )
+        sparse_indices.append(group_indices)
+
+        if return_group:
+            group_dict[value] = group_indices
+
+    sample_indices = sorted(list(chain.from_iterable(sparse_indices)))
+
+    if return_group:
+        return sample_indices, group_dict
+
+    return sample_indices
+
+
+class ExactFastVarDropSampler:
+    """
+    Thin measurement wrapper around efficient_sampler_fast_exact().
+
+    There is NO cache, probe, threshold, stale state, or approximation.
+    Every batch recomputes full k-DFH exactly as original VarDrop.
+    """
+
+    def __init__(
+        self,
+        k,
+        group_size,
+        freq_list,
+        min_thres=None,
+        log_every=100
+    ):
+        self.k = int(k)
+        self.group_size = int(group_size)
+        self.freq_list = list(freq_list) if freq_list is not None else None
+        self.min_thres = min_thres
+        self.log_every = int(log_every)
+
+        if self.k <= 0:
+            raise ValueError('k must be positive.')
+        if self.group_size <= 0:
+            raise ValueError('group_size must be positive.')
+
+        self.total_calls = 0
+        self.total_sampler_time = 0.0
+
+    def __call__(self, x):
+        start = time.perf_counter()
+
+        result = efficient_sampler_fast_exact(
+            x,
+            k=self.k,
+            group_size=self.group_size,
+            freq_list=self.freq_list,
+            min_thres=self.min_thres
+        )
+
+        self.total_calls += 1
+        self.total_sampler_time += time.perf_counter() - start
+
+        if self.log_every > 0 and self.total_calls % self.log_every == 0:
+            print(self.format_status())
+
+        return result
+
+    def get_stats(self):
+        mean_ms = (
+            1000.0 * self.total_sampler_time / self.total_calls
+            if self.total_calls > 0 else 0.0
+        )
+        return {
+            'calls': self.total_calls,
+            'sampler_time_sec': self.total_sampler_time,
+            'mean_sampler_ms': mean_ms,
+        }
+
+    def format_status(self, prefix='[FastVarDrop]'):
+        stats = self.get_stats()
+        return (
+            f"{prefix} calls={stats['calls']} "
+            f"sampler_time={stats['sampler_time_sec']:.3f}s "
+            f"mean_sampler={stats['mean_sampler_ms']:.3f}ms"
+        )
