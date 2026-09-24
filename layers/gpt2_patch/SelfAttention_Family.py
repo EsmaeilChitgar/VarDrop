@@ -139,20 +139,93 @@ class FullAttention(nn.Module):
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
+        # Optional multiplicity correction used only by Mass-Preserving VarDrop.
+        # None means standard/original attention.
+        self.variate_mass = None
+        self.mass_alpha = 1.0
+
+    def set_variate_mass(self, mass=None, alpha=1.0):
+        """
+        Set or clear multiplicity weights for retained variate tokens.
+
+        Parameters
+        ----------
+        mass : 1-D tensor or None
+            One positive mass per retained variate token.
+        alpha : float
+            Strength of the correction.
+            alpha=0 reproduces the original attention exactly.
+            alpha=1 applies full log-mass correction.
+        """
+        if mass is None:
+            self.variate_mass = None
+            self.mass_alpha = float(alpha)
+            return
+
+        if mass.dim() != 1:
+            raise ValueError("variate_mass must be a 1-D tensor.")
+
+        if torch.any(mass <= 0):
+            raise ValueError("All variate masses must be positive.")
+
+        self.variate_mass = mass
+        self.mass_alpha = float(alpha)
+
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+        logits = scale * scores
+
+        # Mass-Preserving VarDrop:
+        #
+        #   softmax(qk/sqrt(d) + alpha * log(mass))
+        #
+        # The bias is applied only along the KEY dimension. If iTransformer
+        # appends temporal/covariate tokens after the variate tokens, they get
+        # unit mass, hence zero log-bias.
+        if self.variate_mass is not None and self.mass_alpha != 0.0:
+            mass = self.variate_mass.to(
+                device=logits.device,
+                dtype=logits.dtype
+            )
+
+            n_variate = mass.numel()
+
+            if n_variate > S:
+                raise RuntimeError(
+                    "Mass-Preserving VarDrop received more masses "
+                    f"({n_variate}) than attention keys ({S})."
+                )
+
+            log_mass = self.mass_alpha * torch.log(
+                mass.clamp_min(1e-8)
+            )
+
+            if n_variate < S:
+                log_mass = torch.cat(
+                    [
+                        log_mass,
+                        torch.zeros(
+                            S - n_variate,
+                            device=logits.device,
+                            dtype=logits.dtype
+                        )
+                    ],
+                    dim=0
+                )
+
+            logits = logits + log_mass.view(1, 1, 1, S)
 
         if self.mask_flag:
             if attn_mask is None:
                 attn_mask = TriangularCausalMask(B, L, device=queries.device)
 
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+            logits.masked_fill_(attn_mask.mask, -np.inf)
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        A = self.dropout(torch.softmax(logits, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
 
         if self.output_attention:

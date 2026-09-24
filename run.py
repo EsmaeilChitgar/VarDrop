@@ -90,6 +90,17 @@ if __name__ == '__main__':
     # RedAttention
     parser.add_argument('--k', type=int, required=False, help='number of dominant frequency for k-DFH' )
     parser.add_argument('--group_size', type=int, required=False)
+    parser.add_argument(
+        '--mass_vardrop',
+        action='store_true',
+        help='enable multiplicity-aware attention correction during VarDrop training'
+    )
+    parser.add_argument(
+        '--mass_alpha',
+        type=float,
+        default=1.0,
+        help='mass correction strength: 0=original attention, 1=full log-mass correction'
+    )
     
 
     args = parser.parse_args()
@@ -136,6 +147,9 @@ if __name__ == '__main__':
                 args.group_size,
                 args.class_strategy, ii)
 
+            if args.mass_vardrop:
+                setting += '_mass_a{}'.format(args.mass_alpha)
+
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -170,6 +184,9 @@ if __name__ == '__main__':
             args.k,
             args.group_size,
             args.class_strategy, ii)
+
+        if args.mass_vardrop:
+            setting += '_mass_a{}'.format(args.mass_alpha)
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

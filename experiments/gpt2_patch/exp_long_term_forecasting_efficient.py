@@ -16,12 +16,16 @@ warnings.filterwarnings('ignore')
 
 import sys
 sys.path.append('..')
-from VarDrop import efficient_sampler 
+from VarDrop import efficient_sampler, efficient_sampler_with_mass 
 
 
 class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast_Efficient, self).__init__(args)
+
+        self.mass_vardrop = bool(getattr(args, 'mass_vardrop', False))
+        self.mass_alpha = float(getattr(args, 'mass_alpha', 1.0))
+        self._mass_debug_printed = False
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -42,7 +46,36 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _set_attention_mass(self, masses):
+        """
+        Set/clear Mass-Preserving VarDrop weights in all compatible
+        FullAttention modules. With masses=None this restores standard attention.
+        """
+        if masses is None:
+            mass_tensor = None
+        else:
+            mass_tensor = torch.as_tensor(
+                masses,
+                dtype=torch.float32,
+                device=self.device
+            )
+
+        found = 0
+        for module in self.model.modules():
+            setter = getattr(module, 'set_variate_mass', None)
+            if callable(setter):
+                setter(mass_tensor, alpha=self.mass_alpha)
+                found += 1
+
+        if self.mass_vardrop and found == 0:
+            raise RuntimeError(
+                "Mass-Preserving VarDrop is enabled, but no compatible "
+                "FullAttention layer was found."
+            )
+
     def vali(self, vali_data, vali_loader, criterion, partial_train=False):
+        # Original VarDrop validates on all variates: no mass correction here.
+        self._set_attention_mass(None)
         total_loss = []
         self.model.eval()
         with torch.no_grad():
@@ -139,13 +172,36 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # VarDrop ----------------------------
-                sparse_indices = efficient_sampler(
-                    batch_x, 
-                    k=self.args.k, 
-                    group_size=self.args.group_size, 
-                    freq_list=range(1,25)
-                )
-                sparse_indices = np.unique(sparse_indices)
+                original_n = batch_x.shape[-1]
+
+                if self.mass_vardrop:
+                    sparse_indices, variate_masses = efficient_sampler_with_mass(
+                        batch_x,
+                        k=self.args.k,
+                        group_size=self.args.group_size,
+                        freq_list=range(1,25)
+                    )
+                else:
+                    sparse_indices = efficient_sampler(
+                        batch_x,
+                        k=self.args.k,
+                        group_size=self.args.group_size,
+                        freq_list=range(1,25)
+                    )
+                    sparse_indices = np.unique(sparse_indices)
+                    variate_masses = None
+
+                if self.mass_vardrop and not self._mass_debug_printed:
+                    print(
+                        "[MassVarDrop DEBUG] "
+                        f"selected={len(sparse_indices)}, "
+                        f"original={original_n}, "
+                        f"mass_sum={float(np.sum(variate_masses)):.4f}, "
+                        f"mass_min={float(np.min(variate_masses)):.4f}, "
+                        f"mass_max={float(np.max(variate_masses)):.4f}, "
+                        f"alpha={self.mass_alpha}"
+                    )
+                    self._mass_debug_printed = True
 
                 batch_x = batch_x[:, :, sparse_indices]
                 batch_y = batch_y[:, :, sparse_indices]
@@ -156,45 +212,50 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
                 # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                self._set_attention_mass(variate_masses)
+                try:
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+    
+                            f_dim = -1 if self.args.features == 'MS' else 0
+                            outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                            batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                            loss = criterion(outputs, batch_y)
+                            train_loss.append(loss.item())
+                    else:
                         if self.args.output_attention:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        elif self.args.channel_independence:
+                            B, Tx, N = batch_x.shape
+                            _, Ty, _ = dec_inp.shape
+                            if batch_x_mark == None:
+                                outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1), batch_x_mark, \
+                                                     dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1), batch_y_mark).reshape(
+                                    B, N, -1).permute(0, 2, 1)
+                            else:
+                                a = batch_x.permute(0, 2, 1)
+                                b = batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1)
+                                outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
+                                                     batch_x_mark.repeat(N, 1, 1), \
+                                                     dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
+                                                     batch_y_mark.repeat(N, 1, 1)) \
+                                    .reshape(B, N, -1).permute(0, 2, 1)
                         else:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
+    
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    elif self.args.channel_independence:
-                        B, Tx, N = batch_x.shape
-                        _, Ty, _ = dec_inp.shape
-                        if batch_x_mark == None:
-                            outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1), batch_x_mark, \
-                                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1), batch_y_mark).reshape(
-                                B, N, -1).permute(0, 2, 1)
-                        else:
-                            a = batch_x.permute(0, 2, 1)
-                            b = batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1)
-                            outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
-                                                 batch_x_mark.repeat(N, 1, 1), \
-                                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
-                                                 batch_y_mark.repeat(N, 1, 1)) \
-                                .reshape(B, N, -1).permute(0, 2, 1)
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
-
+    
+                finally:
+                    # Do not leak sparse-training mass into validation/test.
+                    self._set_attention_mass(None)
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / iter_count
@@ -232,6 +293,7 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
 
     def test(self, setting, test=0):
 
+        self._set_attention_mass(None)
         test_data, test_loader = self._get_data(flag='test')
         if test:
             print('loading model')
@@ -339,6 +401,7 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         return
 
     def predict(self, setting, load=False):
+        self._set_attention_mass(None)
         pred_data, pred_loader = self._get_data(flag='pred')
 
         if load:
