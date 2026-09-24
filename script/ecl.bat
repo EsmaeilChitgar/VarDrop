@@ -11,40 +11,38 @@ set "group_size=10"
 set "iter=1"
 
 :: ==========================================
-:: Experiment 1: traffic_96_96
+:: Experiment 1: ECL_96_96_250
 :: ==========================================
 set "START_TIME=%TIME%"
 echo ==========================================
-echo Running Experiment 1 (traffic_96_96_400_random1)...
+echo Running Experiment 1 (ECL_96_96_main)...
 echo Start Time: !START_TIME!
 echo ==========================================
 
 python -u run.py ^
   --is_training 1 ^
-  --root_path ./dataset/traffic/ ^
-  --data_path traffic.csv ^
-  --model_id traffic_96_96_400_random1 ^
+  --root_path ./dataset/electricity/ ^
+  --data_path electricity.csv ^
+  --model_id ECL_96_96_main ^
   --model %model_name% ^
   --data custom ^
   --features M ^
   --seq_len 96 ^
   --pred_len 96 ^
-  --e_layers 4 ^
-  --enc_in 862 ^
-  --dec_in 862 ^
-  --c_out 862 ^
+  --e_layers 3 ^
+  --enc_in 321 ^
+  --dec_in 321 ^
+  --c_out 321 ^
   --des Exp ^
   --d_model 512 ^
   --d_ff 512 ^
   --batch_size 32 ^
-  --learning_rate 0.001 ^
+  --learning_rate 0.0005 ^
   --k %k% ^
   --group_size %group_size% ^
   --itr %iter% ^
-  --num_workers 1 ^
-  --vardrop_version 4 ^
-  --target_tokens 400 ^
-  --sampler_refresh 64
+  --num_workers 1
+
 
 set "END_TIME=%TIME%"
 echo End Time: !END_TIME!
@@ -52,49 +50,6 @@ call :CalculateDuration "!START_TIME!" "!END_TIME!" DURATION
 echo Duration: !DURATION!
 echo.
 
-
-
-:: ==========================================
-:: Experiment 1: traffic_96_96
-:: ==========================================
-set "START_TIME=%TIME%"
-echo ==========================================
-echo Running Experiment 1 (traffic_96_96_400_random2)...
-echo Start Time: !START_TIME!
-echo ==========================================
-
-python -u run.py ^
-  --is_training 1 ^
-  --root_path ./dataset/traffic/ ^
-  --data_path traffic.csv ^
-  --model_id traffic_96_96_400_random2 ^
-  --model %model_name% ^
-  --data custom ^
-  --features M ^
-  --seq_len 96 ^
-  --pred_len 96 ^
-  --e_layers 4 ^
-  --enc_in 862 ^
-  --dec_in 862 ^
-  --c_out 862 ^
-  --des Exp ^
-  --d_model 512 ^
-  --d_ff 512 ^
-  --batch_size 32 ^
-  --learning_rate 0.001 ^
-  --k %k% ^
-  --group_size %group_size% ^
-  --itr %iter% ^
-  --num_workers 1 ^
-  --vardrop_version 5 ^
-  --target_tokens 400 ^
-  --sampler_refresh 64
-
-set "END_TIME=%TIME%"
-echo End Time: !END_TIME!
-call :CalculateDuration "!START_TIME!" "!END_TIME!" DURATION
-echo Duration: !DURATION!
-echo.
 
 echo ==========================================
 echo ALL EXPERIMENTS COMPLETED.

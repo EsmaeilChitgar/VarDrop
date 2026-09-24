@@ -95,7 +95,7 @@ if __name__ == '__main__':
         '--vardrop_version',
         type=int,
         default=0,
-        choices=[0, 1, 2, 3],
+        choices=[0, 1, 2, 3, 4, 5],
         help='0: Original, 1: Temporal Representative, '
              '2: Adaptive Budget, 3: Cached Adaptive'
     )
