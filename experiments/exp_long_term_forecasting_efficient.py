@@ -16,12 +16,29 @@ warnings.filterwarnings('ignore')
 
 import sys
 sys.path.append('..')
-from VarDrop import efficient_sampler 
+from VarDrop import efficient_sampler, StabilityGatedSampler
 
 
 class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast_Efficient, self).__init__(args)
+
+        self.stability_vardrop = bool(
+            getattr(args, 'stability_vardrop', False)
+        )
+
+        self.stability_sampler = None
+
+        if self.stability_vardrop:
+            self.stability_sampler = StabilityGatedSampler(
+                k=self.args.k,
+                group_size=self.args.group_size,
+                freq_list=range(1, 25),
+                probe_size=getattr(args, 'stability_probe_size', 4),
+                stability_threshold=getattr(args, 'stability_threshold', 0.98),
+                max_stale_batches=getattr(args, 'stability_max_stale', 64),
+                log_every=getattr(args, 'stability_log_every', 100)
+            )
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -123,6 +140,11 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
             iter_count = 0
             train_loss = []
 
+            # Establish a fresh full-batch k-DFH cache at the start
+            # of every epoch. This bounds cache age across shuffles.
+            if self.stability_sampler is not None:
+                self.stability_sampler.reset_epoch()
+
             self.model.train()
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
@@ -139,12 +161,17 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # VarDrop ----------------------------
-                sparse_indices = efficient_sampler(
-                    batch_x, 
-                    k=self.args.k, 
-                    group_size=self.args.group_size, 
-                    freq_list=range(1,25)
-                )
+                if self.stability_sampler is not None:
+                    sparse_indices = self.stability_sampler(batch_x)
+                else:
+                    sparse_indices = efficient_sampler(
+                        batch_x,
+                        k=self.args.k,
+                        group_size=self.args.group_size,
+                        freq_list=range(1,25)
+                    )
+
+                # Keep the original experiment behavior.
                 sparse_indices = np.unique(sparse_indices)
 
                 batch_x = batch_x[:, :, sparse_indices]
@@ -212,6 +239,14 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+
+            if self.stability_sampler is not None:
+                print(
+                    self.stability_sampler.format_status(
+                        prefix='[SG-VarDrop Epoch {}]'.format(epoch + 1)
+                    )
+                )
+
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion, partial_train=False)
             test_loss = self.vali(test_data, test_loader, criterion, partial_train=False)

@@ -90,6 +90,37 @@ if __name__ == '__main__':
     # RedAttention
     parser.add_argument('--k', type=int, required=False, help='number of dominant frequency for k-DFH' )
     parser.add_argument('--group_size', type=int, required=False)
+
+    # GPT3: Stability-Gated VarDrop
+    parser.add_argument(
+        '--stability_vardrop',
+        action='store_true',
+        help='enable stability-gated reuse of VarDrop k-DFH groups'
+    )
+    parser.add_argument(
+        '--stability_probe_size',
+        type=int,
+        default=4,
+        help='number of batch examples used for spectral stability probing'
+    )
+    parser.add_argument(
+        '--stability_threshold',
+        type=float,
+        default=0.98,
+        help='minimum cached-group purity required to reuse cached groups'
+    )
+    parser.add_argument(
+        '--stability_max_stale',
+        type=int,
+        default=64,
+        help='maximum number of cache reuses before a forced full k-DFH refresh; 0 disables the bound'
+    )
+    parser.add_argument(
+        '--stability_log_every',
+        type=int,
+        default=100,
+        help='print SG-VarDrop diagnostics every N training calls; 0 disables periodic logs'
+    )
     
 
     args = parser.parse_args()
@@ -136,6 +167,13 @@ if __name__ == '__main__':
                 args.group_size,
                 args.class_strategy, ii)
 
+            if args.stability_vardrop:
+                setting += '_sg_ps{}_th{}_ms{}'.format(
+                    args.stability_probe_size,
+                    args.stability_threshold,
+                    args.stability_max_stale
+                )
+
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -170,6 +208,13 @@ if __name__ == '__main__':
             args.k,
             args.group_size,
             args.class_strategy, ii)
+
+        if args.stability_vardrop:
+            setting += '_sg_ps{}_th{}_ms{}'.format(
+                args.stability_probe_size,
+                args.stability_threshold,
+                args.stability_max_stale
+            )
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
