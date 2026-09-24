@@ -65,7 +65,8 @@ python -u diagnostics\gpt4_weight_rank_diag.py ^
   --diag_batches 16 ^
   --ranks 64,128,256 ^
   --modes attention,ffn,both ^
-  --seed 2023
+  --seed 2023 ^
+  --svd_cpu
 
 set "EXIT_CODE=!ERRORLEVEL!"
 echo.

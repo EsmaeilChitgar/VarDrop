@@ -142,10 +142,17 @@ def restore_targets(targets: List[TargetMatrix]) -> None:
 
 
 def compute_svd(targets: List[TargetMatrix], svd_device: torch.device) -> None:
-    print(f'[GPT4-DIAG] Computing SVDs on {svd_device} ...')
+    # Functional rank ablation is a diagnostic, not a training-time operation.
+    # On CUDA, float32 torch.linalg.svd may reconstruct a full-rank 512x512
+    # matrix with ~1e-4 relative error (cuSOLVER numerical behavior). That is
+    # large enough to contaminate our sanity control. When SVD is requested on
+    # CPU we therefore promote the *already-trained float32 weights* to float64
+    # solely for the decomposition/reconstruction. No model weights are changed
+    # until a reconstructed matrix is copied back to the original float32 param.
+    svd_dtype = torch.float64 if svd_device.type == 'cpu' else torch.float32
+    print(f'[GPT4-DIAG] Computing SVDs on {svd_device} with dtype={svd_dtype} ...')
     for i, target in enumerate(targets, start=1):
-        mat = target.matrix.to(svd_device)
-        # float32 is intentional: these are float32 trained model weights.
+        mat = target.matrix.to(device=svd_device, dtype=svd_dtype)
         u, s, vh = torch.linalg.svd(mat, full_matrices=False)
         target.u = u.detach().cpu()
         target.s = s.detach().cpu()
