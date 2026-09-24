@@ -16,12 +16,26 @@ warnings.filterwarnings('ignore')
 
 import sys
 sys.path.append('..')
-from VarDrop import efficient_sampler 
+from VarDrop import efficient_sampler, ExactFastVarDropSampler
 
 
 class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast_Efficient, self).__init__(args)
+
+        # GPT3b: exact fast k-DFH. No caching or approximation.
+        self.exact_fast_vardrop = bool(
+            getattr(args, 'exact_fast_vardrop', False)
+        )
+        self.fast_vardrop_sampler = None
+
+        if self.exact_fast_vardrop:
+            self.fast_vardrop_sampler = ExactFastVarDropSampler(
+                k=args.k,
+                group_size=args.group_size,
+                freq_list=range(1, 25),
+                log_every=getattr(args, 'fast_log_every', 100)
+            )
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -139,12 +153,17 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # VarDrop ----------------------------
-                sparse_indices = efficient_sampler(
-                    batch_x, 
-                    k=self.args.k, 
-                    group_size=self.args.group_size, 
-                    freq_list=range(1,25)
-                )
+                if self.fast_vardrop_sampler is not None:
+                    sparse_indices = self.fast_vardrop_sampler(batch_x)
+                else:
+                    sparse_indices = efficient_sampler(
+                        batch_x,
+                        k=self.args.k,
+                        group_size=self.args.group_size,
+                        freq_list=range(1,25)
+                    )
+
+                # Preserve original experiment behavior exactly.
                 sparse_indices = np.unique(sparse_indices)
 
                 batch_x = batch_x[:, :, sparse_indices]
@@ -212,6 +231,12 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            if self.fast_vardrop_sampler is not None:
+                print(
+                    self.fast_vardrop_sampler.format_status(
+                        prefix=f"[FastVarDrop Epoch {epoch + 1}]"
+                    )
+                )
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion, partial_train=False)
             test_loss = self.vali(test_data, test_loader, criterion, partial_train=False)

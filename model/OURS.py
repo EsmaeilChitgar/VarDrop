@@ -21,6 +21,25 @@ class Model(nn.Module):
         # Embedding
         self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout)
         self.class_strategy = configs.class_strategy
+
+        # GPT4-A: keep the residual representation at d_model, while optionally
+        # narrowing only the expensive Q/K/V interaction space. When the option
+        # is omitted, d_keys/d_values stay None and AttentionLayer follows the
+        # original VarDrop/iTransformer path exactly.
+        self.gpt4_attn_dim = getattr(configs, 'gpt4_attn_dim', None)
+        if self.gpt4_attn_dim is not None:
+            if self.gpt4_attn_dim <= 0:
+                raise ValueError('gpt4_attn_dim must be positive')
+            if self.gpt4_attn_dim % configs.n_heads != 0:
+                raise ValueError(
+                    f'gpt4_attn_dim ({self.gpt4_attn_dim}) must be divisible by n_heads ({configs.n_heads})'
+                )
+            attn_d_keys = self.gpt4_attn_dim // configs.n_heads
+            attn_d_values = self.gpt4_attn_dim // configs.n_heads
+        else:
+            attn_d_keys = None
+            attn_d_values = None
+
         # Encoder-only architecture
         self.encoder = Encoder(
             [
@@ -28,7 +47,8 @@ class Model(nn.Module):
                     AttentionLayer(
                         FullAttention(
                             False, configs.factor, attention_dropout=configs.dropout, output_attention=configs.output_attention
-                        ), configs.d_model, configs.n_heads),
+                        ), configs.d_model, configs.n_heads,
+                        d_keys=attn_d_keys, d_values=attn_d_values),
                     configs.d_model,
                     configs.d_ff,
                     dropout=configs.dropout,

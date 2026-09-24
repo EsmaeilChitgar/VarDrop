@@ -44,6 +44,8 @@ if __name__ == '__main__':
     parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
     parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
     parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
+    parser.add_argument('--gpt4_attn_dim', type=int, default=None,
+                        help='GPT4-A total internal Q/K/V attention width; omit for exact baseline behavior')
     parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
     parser.add_argument('--factor', type=int, default=1, help='attn factor')
     parser.add_argument('--distil', action='store_false',
@@ -90,6 +92,19 @@ if __name__ == '__main__':
     # RedAttention
     parser.add_argument('--k', type=int, required=False, help='number of dominant frequency for k-DFH' )
     parser.add_argument('--group_size', type=int, required=False)
+
+    # GPT3b: exact fast k-DFH (no cache, no approximation)
+    parser.add_argument(
+        '--exact_fast_vardrop',
+        action='store_true',
+        help='use exact fast k-DFH implementation for VarDrop'
+    )
+    parser.add_argument(
+        '--fast_log_every',
+        type=int,
+        default=100,
+        help='log Exact Fast VarDrop sampler timing every N training batches'
+    )
     
 
     args = parser.parse_args()
@@ -136,6 +151,9 @@ if __name__ == '__main__':
                 args.group_size,
                 args.class_strategy, ii)
 
+            if args.exact_fast_vardrop:
+                setting += '_fastdfh'
+
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -170,6 +188,9 @@ if __name__ == '__main__':
             args.k,
             args.group_size,
             args.class_strategy, ii)
+
+        if args.exact_fast_vardrop:
+            setting += '_fastdfh'
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
