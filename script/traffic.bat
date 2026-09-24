@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
+cd /d "%~dp0.."
 
 echo ========================================================================================
 echo GPT4 Diagnostic 2 - Traffic 96 to 96
