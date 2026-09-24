@@ -1,44 +1,46 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-cd /d "%~dp0\.."
 
-echo ======================================================================
-echo GPT4 Diagnostic - Traffic 96 to 96
-echo Weight Spectrum + Functional Low-Rank Ablation
-echo NO TRAINING - CHECKPOINT SCREEN ONLY
-echo ======================================================================
+echo ========================================================================================
+echo GPT4 Diagnostic 2 - Traffic 96 to 96
+echo Batch Spectral Redundancy vs Low-Rank Sensitivity
+echo NO TRAINING - FIXED VARDROP SUBSETS - CHECKPOINT SCREEN ONLY
+echo ========================================================================================
 echo.
 
-REM Use the exact FastVarDrop Traffic checkpoint. Its learned trajectory/results
-REM matched Original VarDrop exactly in our previous control.
 set "CHECKPOINT=.\checkpoints\traffic_96_96_gpt3b_fast_OURS_custom_M_ft96_sl48_ll96_pl512_dm8_nh4_el1_dl512_df1_fctimeF_ebTrue_dttest_k4_gs10_projection_0_fastdfh\checkpoint.pth"
-set "OUTPUT_DIR=.\diagnostics\results\traffic_gpt4_weight_rank"
+set "OUTPUT=.\diagnostics\results\traffic_gpt4_redundancy_rank"
 
 if not exist "%CHECKPOINT%" (
     echo ERROR: checkpoint not found:
-    echo   %CHECKPOINT%
-    echo.
-    echo Edit CHECKPOINT at the top of this BAT file if your checkpoint folder has a different name.
+    echo %CHECKPOINT%
     exit /b 2
 )
 
-echo [1/2] Running diagnostic helper self-test...
-python -u diagnostics\gpt4_weight_rank_diag.py --self_test
+echo [1/2] Running helper self-test...
+python -u diagnostics\gpt4_redundancy_rank_diag.py --self_test
 if errorlevel 1 (
-    echo SELF-TEST FAILED. Real diagnostic will NOT run.
+    echo ERROR: helper self-test failed.
     exit /b 3
 )
 
 echo.
-echo [2/2] Running checkpoint diagnostic...
+echo [2/2] Running batch redundancy-rank diagnostic...
 echo Checkpoint: %CHECKPOINT%
-echo Output    : %OUTPUT_DIR%
+echo Output    : %OUTPUT%
 echo.
 
-python -u diagnostics\gpt4_weight_rank_diag.py ^
+python -u diagnostics\gpt4_redundancy_rank_diag.py ^
   --checkpoint_path "%CHECKPOINT%" ^
-  --output_dir "%OUTPUT_DIR%" ^
+  --output_dir "%OUTPUT%" ^
+  --diag_batches 48 ^
+  --permutations 1999 ^
+  --safe_gap_pct 3.0 ^
+  --k 4 ^
+  --group_size 10 ^
+  --freq_start 1 ^
+  --freq_end 25 ^
   --data custom ^
   --root_path ./dataset/traffic/ ^
   --data_path traffic.csv ^
@@ -57,23 +59,16 @@ python -u diagnostics\gpt4_weight_rank_diag.py ^
   --d_layers 1 ^
   --d_ff 512 ^
   --factor 1 ^
-  --dropout 0.1 ^
   --embed timeF ^
-  --activation gelu ^
-  --batch_size 16 ^
-  --num_workers 0 ^
-  --diag_batches 16 ^
-  --ranks 64,128,256 ^
-  --modes attention,ffn,both ^
-  --seed 2023 ^
-  --svd_cpu
+  --batch_size 32 ^
+  --num_workers 0
 
 set "EXIT_CODE=!ERRORLEVEL!"
 echo.
-echo ======================================================================
-echo GPT4 Diagnostic finished. Exit Code: !EXIT_CODE!
-echo Results folder: %OUTPUT_DIR%
-echo Please copy the CONTROL, SVD SANITY, FUNCTIONAL, SPECTRAL SUMMARY,
-echo DECISION lines (or send summary.json + functional.csv).
-echo ======================================================================
+echo ========================================================================================
+echo GPT4 redundancy-rank diagnostic finished. Exit Code: !EXIT_CODE!
+echo Results folder: %OUTPUT%
+echo Please copy the REDUNDANCY, CONTROL, RANK SUMMARY, CORRELATION, QUARTILE,
+echo and DECISION sections, or send summary.json + batch_metrics.csv.
+echo ========================================================================================
 exit /b !EXIT_CODE!
