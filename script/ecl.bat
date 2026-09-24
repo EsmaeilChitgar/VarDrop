@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
+set "CUDA_VISIBLE_DEVICES=0"
 
 echo ==========================================================
 echo GPT3b Exact Fast VarDrop - ECL 96 to 96
