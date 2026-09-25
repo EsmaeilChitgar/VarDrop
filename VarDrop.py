@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import time
+import os
 from itertools import chain
 
 
@@ -62,11 +63,62 @@ def efficient_sampler(x, k, group_size, freq_list, min_thres=None, return_group=
 # GPT3b: Exact Fast k-DFH VarDrop
 # ============================================================
 
+# ============================================================
+# GPT3c: Anchor-Set k-DFH
+# ============================================================
+
+def _canonicalize_anchor_set(k_freqs, k_amps):
+    """
+    Keep the strongest dominant frequency as an ordered anchor, but treat
+    ranks 2..k as an unordered set.
+
+    This removes a brittle distinction in ranked k-DFH: two variates can have
+    the same dominant-frequency support and the same strongest period, yet be
+    assigned to different groups only because weaker peaks swap amplitude
+    order from one batch to another.
+
+    k_amps follow the same permutation so min_thres semantics stay aligned.
+    """
+    if k_freqs.shape[0] <= 2:
+        return k_freqs, k_amps
+
+    tail_order = torch.argsort(k_freqs[1:], dim=0)
+    tail_freqs = torch.gather(k_freqs[1:], 0, tail_order)
+    tail_amps = torch.gather(k_amps[1:], 0, tail_order)
+
+    k_freqs = torch.cat([k_freqs[:1], tail_freqs], dim=0)
+    k_amps = torch.cat([k_amps[:1], tail_amps], dim=0)
+    return k_freqs, k_amps
+
+
+def _resolve_gpt3c_hash_mode(hash_mode=None):
+    """Resolve GPT3b ranked mode vs GPT3c Anchor-Set mode."""
+    if hash_mode is None:
+        hash_mode = os.environ.get('GPT3C_HASH_MODE', 'anchor_set')
+
+    hash_mode = str(hash_mode).strip().lower()
+    aliases = {
+        'ranked': 'ranked',
+        'gpt3b': 'ranked',
+        'exact': 'ranked',
+        'anchor_set': 'anchor_set',
+        'anchor': 'anchor_set',
+        'gpt3c': 'anchor_set',
+    }
+    if hash_mode not in aliases:
+        raise ValueError(
+            f"Unknown GPT3C_HASH_MODE={hash_mode!r}. "
+            "Use 'ranked' or 'anchor_set'."
+        )
+    return aliases[hash_mode]
+
+
 def k_dominant_frequency_hashing_fast_exact(
     batch_x,
     k,
     freq_list=None,
-    min_thres=None
+    min_thres=None,
+    hash_mode=None
 ):
     """
     Exact k-DFH equivalent to k_dominant_frequency_hashing(), but avoids
@@ -78,8 +130,9 @@ def k_dominant_frequency_hashing_fast_exact(
         - The only optimization is one batched device-to-CPU transfer of the
           [k, n_vars] top-k frequency tensor before Python string construction.
 
-    Therefore, with the same input and RNG state, downstream groups and sampled
-    indices are expected to match original VarDrop exactly.
+    GPT3c extension:
+        - hash_mode='ranked' is exact GPT3b behavior.
+        - hash_mode='anchor_set' preserves rank-1 and canonicalizes ranks 2..k.
     """
     x_amp = torch.fft.rfft(batch_x, dim=1).abs()
     x_amp = torch.mean(x_amp, dim=0)
@@ -91,6 +144,10 @@ def k_dominant_frequency_hashing_fast_exact(
         k_freqs += freq_list[0]
     else:
         k_amps, k_freqs = torch.topk(x_amp, k=k, dim=0)
+
+    hash_mode = _resolve_gpt3c_hash_mode(hash_mode)
+    if hash_mode == 'anchor_set':
+        k_freqs, k_amps = _canonicalize_anchor_set(k_freqs, k_amps)
 
     if min_thres is not None:
         k_freqs = k_freqs * (k_amps >= min_thres)
@@ -122,7 +179,9 @@ def efficient_sampler_fast_exact(
     group_size,
     freq_list,
     min_thres=None,
-    return_group=False
+    return_group=False,
+    hash_mode=None,
+    return_stats=False
 ):
     """
     Exact-behavior fast implementation of original VarDrop sampling.
@@ -141,15 +200,19 @@ def efficient_sampler_fast_exact(
         x,
         k=k,
         freq_list=freq_list,
-        min_thres=min_thres
+        min_thres=min_thres,
+        hash_mode=hash_mode
     )
 
+    hash_mode = _resolve_gpt3c_hash_mode(hash_mode)
     sparse_indices = []
 
     if return_group:
         group_dict = {}
 
-    for value in np.unique(hash_values):
+    unique_hash_values = np.unique(hash_values)
+
+    for value in unique_hash_values:
         group_indices = np.where(hash_values == value)[0].tolist()
         group_indices = np.random.choice(
             group_indices,
@@ -163,8 +226,19 @@ def efficient_sampler_fast_exact(
 
     sample_indices = sorted(list(chain.from_iterable(sparse_indices)))
 
+    stats = {
+        'hash_mode': hash_mode,
+        'n_groups': int(len(unique_hash_values)),
+        'n_unique_tokens': int(len(set(sample_indices))),
+    }
+
     if return_group:
+        if return_stats:
+            return sample_indices, group_dict, stats
         return sample_indices, group_dict
+
+    if return_stats:
+        return sample_indices, stats
 
     return sample_indices
 
@@ -190,6 +264,7 @@ class ExactFastVarDropSampler:
         self.freq_list = list(freq_list) if freq_list is not None else None
         self.min_thres = min_thres
         self.log_every = int(log_every)
+        self.hash_mode = _resolve_gpt3c_hash_mode()
 
         if self.k <= 0:
             raise ValueError('k must be positive.')
@@ -198,20 +273,26 @@ class ExactFastVarDropSampler:
 
         self.total_calls = 0
         self.total_sampler_time = 0.0
+        self.total_groups = 0
+        self.total_unique_tokens = 0
 
     def __call__(self, x):
         start = time.perf_counter()
 
-        result = efficient_sampler_fast_exact(
+        result, sampler_stats = efficient_sampler_fast_exact(
             x,
             k=self.k,
             group_size=self.group_size,
             freq_list=self.freq_list,
-            min_thres=self.min_thres
+            min_thres=self.min_thres,
+            hash_mode=self.hash_mode,
+            return_stats=True
         )
 
         self.total_calls += 1
         self.total_sampler_time += time.perf_counter() - start
+        self.total_groups += sampler_stats['n_groups']
+        self.total_unique_tokens += sampler_stats['n_unique_tokens']
 
         if self.log_every > 0 and self.total_calls % self.log_every == 0:
             print(self.format_status())
@@ -223,16 +304,30 @@ class ExactFastVarDropSampler:
             1000.0 * self.total_sampler_time / self.total_calls
             if self.total_calls > 0 else 0.0
         )
+        mean_groups = (
+            self.total_groups / self.total_calls
+            if self.total_calls > 0 else 0.0
+        )
+        mean_unique_tokens = (
+            self.total_unique_tokens / self.total_calls
+            if self.total_calls > 0 else 0.0
+        )
         return {
             'calls': self.total_calls,
             'sampler_time_sec': self.total_sampler_time,
             'mean_sampler_ms': mean_ms,
+            'hash_mode': self.hash_mode,
+            'mean_groups': mean_groups,
+            'mean_unique_tokens': mean_unique_tokens,
         }
 
     def format_status(self, prefix='[FastVarDrop]'):
         stats = self.get_stats()
         return (
-            f"{prefix} calls={stats['calls']} "
+            f"{prefix} hash={stats['hash_mode']} "
+            f"calls={stats['calls']} "
             f"sampler_time={stats['sampler_time_sec']:.3f}s "
-            f"mean_sampler={stats['mean_sampler_ms']:.3f}ms"
+            f"mean_sampler={stats['mean_sampler_ms']:.3f}ms "
+            f"mean_groups={stats['mean_groups']:.2f} "
+            f"mean_unique_tokens={stats['mean_unique_tokens']:.2f}"
         )
