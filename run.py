@@ -103,6 +103,13 @@ if __name__ == '__main__':
         default=100,
         help='log Exact Fast VarDrop sampler timing every N training batches'
     )
+    # GPT3d: low-rank periodic residual adapter (LPRA)
+    parser.add_argument('--use_lpra', action='store_true', help='enable GPT3d LPRA calibration')
+    parser.add_argument('--lpra_rank', type=int, default=32, help='LPRA factor rank')
+    parser.add_argument('--lpra_period', type=int, default=168, help='LPRA periodic phase count')
+    parser.add_argument('--lpra_cal_epochs', type=int, default=1, help='frozen-backbone LPRA calibration epochs')
+    parser.add_argument('--lpra_lr', type=float, default=0.005, help='LPRA calibration learning rate')
+    parser.add_argument('--lpra_alpha_max', type=float, default=1.25, help='maximum validation shrinkage alpha')
     
 
     args = parser.parse_args()
@@ -151,6 +158,8 @@ if __name__ == '__main__':
 
             if args.exact_fast_vardrop:
                 setting += '_fastdfh'
+            if args.use_lpra:
+                setting += '_lpra_r{}_p{}'.format(args.lpra_rank, args.lpra_period)
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -189,6 +198,8 @@ if __name__ == '__main__':
 
         if args.exact_fast_vardrop:
             setting += '_fastdfh'
+        if args.use_lpra:
+            setting += '_lpra_r{}_p{}'.format(args.lpra_rank, args.lpra_period)
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

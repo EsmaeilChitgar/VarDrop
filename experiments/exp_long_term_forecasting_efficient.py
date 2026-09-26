@@ -56,6 +56,212 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _model_core(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _lpra_enabled(self):
+        return bool(getattr(self.args, 'use_lpra', False))
+
+    def _future_week_phase(self, batch_y_mark):
+        """Decode hour-of-week from iTransformer's hourly timeF features.
+
+        For freq='h', time_features are [HourOfDay, DayOfWeek, ...], normalized
+        respectively as hour/23-0.5 and weekday/6-0.5.  We only use future
+        marks, so no target values are involved and there is no leakage.
+        """
+        if batch_y_mark is None:
+            raise ValueError('LPRA currently requires timeF marks (Traffic/ECL style data).')
+        if batch_y_mark.shape[-1] < 2:
+            raise ValueError('LPRA requires HourOfDay and DayOfWeek timeF features.')
+        period = int(getattr(self.args, 'lpra_period', 168))
+        if period != 168:
+            raise ValueError('The first LPRA experiment supports weekly hourly period=168 only.')
+
+        future_mark = batch_y_mark[:, -self.args.pred_len:, :]
+        hour = torch.round((future_mark[..., 0] + 0.5) * 23.0).long().clamp_(0, 23)
+        weekday = torch.round((future_mark[..., 1] + 0.5) * 6.0).long().clamp_(0, 6)
+        return weekday * 24 + hour
+
+    def _lpra_channel_ids(self, indices=None, n_channels=None):
+        if indices is None:
+            if n_channels is None:
+                raise ValueError('n_channels is required for full-channel LPRA inference')
+            return torch.arange(n_channels, device=self.device, dtype=torch.long)
+        return torch.as_tensor(indices, device=self.device, dtype=torch.long)
+
+    def _apply_lpra(self, outputs, channel_ids, batch_y_mark):
+        if not self._lpra_enabled():
+            return outputs
+        core = self._model_core()
+        phase = self._future_week_phase(batch_y_mark)
+        correction = core.lpra_correction(channel_ids, phase)
+        return outputs + core.lpra_alpha * correction
+
+    def _calibrate_lpra(self, train_loader, vali_loader, criterion, path):
+        """Freeze GPT3b, fit only LPRA on sparse training batches, then choose
+        a validation-only shrinkage alpha. alpha=0 is always an allowed fallback.
+        """
+        if not self._lpra_enabled():
+            return
+
+        core = self._model_core()
+        if core.lpra is None:
+            raise RuntimeError('use_lpra=True but model has no LPRA module')
+
+        cal_epochs = int(getattr(self.args, 'lpra_cal_epochs', 1))
+        cal_lr = float(getattr(self.args, 'lpra_lr', 5e-3))
+        alpha_max = float(getattr(self.args, 'lpra_alpha_max', 1.25))
+
+        # Freeze the complete GPT3b backbone; only the adapter is optimized.
+        for p in core.parameters():
+            p.requires_grad_(False)
+        for p in core.lpra.parameters():
+            p.requires_grad_(True)
+        core.set_lpra_alpha(0.0)
+
+        adapter_optim = optim.Adam(core.lpra.parameters(), lr=cal_lr)
+        print('[LPRA] calibration start: epochs={} lr={} params={}'.format(
+            cal_epochs, cal_lr, core.lpra.num_parameters))
+
+        # Keep the frozen backbone deterministic during calibration.
+        self.model.eval()
+        cal_start = time.time()
+        for epoch in range(cal_epochs):
+            losses = []
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in train_loader:
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                if self.fast_vardrop_sampler is not None:
+                    sparse_indices = self.fast_vardrop_sampler(batch_x)
+                else:
+                    sparse_indices = efficient_sampler(
+                        batch_x,
+                        k=self.args.k,
+                        group_size=self.args.group_size,
+                        freq_list=range(1, 25)
+                    )
+                sparse_indices = np.unique(sparse_indices)
+                channel_ids = self._lpra_channel_ids(indices=sparse_indices)
+
+                batch_x_sparse = batch_x[:, :, sparse_indices]
+                batch_y_sparse = batch_y[:, :, sparse_indices]
+                dec_inp = torch.zeros_like(batch_y_sparse[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat(
+                    [batch_y_sparse[:, :self.args.label_len, :], dec_inp], dim=1
+                ).float().to(self.device)
+
+                with torch.no_grad():
+                    base = self.model(batch_x_sparse, batch_x_mark, dec_inp, batch_y_mark)
+                    base = base[:, -self.args.pred_len:, :]
+                    target = batch_y_sparse[:, -self.args.pred_len:, :]
+
+                phase = self._future_week_phase(batch_y_mark)
+                correction = core.lpra_correction(channel_ids, phase)
+                loss = criterion(base.detach() + correction, target)
+
+                adapter_optim.zero_grad()
+                loss.backward()
+                adapter_optim.step()
+                losses.append(loss.item())
+
+            print('[LPRA] calibration epoch {}/{} loss={:.7f}'.format(
+                epoch + 1, cal_epochs, float(np.mean(losses))))
+
+        print('[LPRA] calibration time: {:.3f}s'.format(time.time() - cal_start))
+
+        # Validation-only scalar shrinkage.  Closed-form MSE alpha is tried first;
+        # if validation MAE regresses, alpha is halved until both metrics are no
+        # worse than GPT3b.  alpha=0 is the exact GPT3b fallback.
+        num = 0.0
+        den = 0.0
+        self.model.eval()
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat(
+                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
+                ).float().to(self.device)
+                base = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                base = base[:, -self.args.pred_len:, :]
+                target = batch_y[:, -self.args.pred_len:, :]
+                ids = self._lpra_channel_ids(n_channels=base.shape[-1])
+                phase = self._future_week_phase(batch_y_mark)
+                corr = core.lpra_correction(ids, phase)
+
+                residual = target - base
+                num += torch.sum(residual * corr).item()
+                den += torch.sum(corr * corr).item()
+
+        alpha_closed = 0.0 if den <= 1e-20 else num / den
+        alpha_closed = float(np.clip(alpha_closed, 0.0, alpha_max))
+
+        # Evaluate alpha_closed and progressively safer halvings in one streaming
+        # validation pass.  This avoids caching the large [B,96,862] tensors.
+        candidates = [alpha_closed * (0.5 ** i) for i in range(9)]
+        candidates.append(0.0)
+        candidates = list(dict.fromkeys(float(a) for a in candidates))
+        stats = {
+            a: {'se': 0.0, 'ae': 0.0, 'count': 0}
+            for a in candidates
+        }
+
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat(
+                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
+                ).float().to(self.device)
+                base = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                base = base[:, -self.args.pred_len:, :]
+                target = batch_y[:, -self.args.pred_len:, :]
+                ids = self._lpra_channel_ids(n_channels=base.shape[-1])
+                phase = self._future_week_phase(batch_y_mark)
+                corr = core.lpra_correction(ids, phase)
+
+                for a in candidates:
+                    err = base + a * corr - target
+                    stats[a]['se'] += torch.sum(err * err).item()
+                    stats[a]['ae'] += torch.sum(torch.abs(err)).item()
+                    stats[a]['count'] += err.numel()
+
+        def _metric_for(a):
+            st = stats[a]
+            return st['se'] / st['count'], st['ae'] / st['count']
+
+        base_mse, base_mae = _metric_for(0.0)
+        alpha = 0.0
+        final_mse, final_mae = base_mse, base_mae
+        for a in candidates:
+            mse_a, mae_a = _metric_for(a)
+            if mse_a <= base_mse + 1e-12 and mae_a <= base_mae + 1e-12:
+                alpha = a
+                final_mse, final_mae = mse_a, mae_a
+                break
+
+        core.set_lpra_alpha(alpha)
+        mse_gain = 100.0 * (base_mse - final_mse) / max(base_mse, 1e-12)
+        mae_gain = 100.0 * (base_mae - final_mae) / max(base_mae, 1e-12)
+        print('[LPRA] alpha_closed={:.6f} alpha={:.6f}'.format(alpha_closed, alpha))
+        print('[LPRA] validation base MSE={:.7f} MAE={:.7f}'.format(base_mse, base_mae))
+        print('[LPRA] validation final MSE={:.7f} MAE={:.7f}'.format(final_mse, final_mae))
+        print('[LPRA] validation gain MSE={:.3f}% MAE={:.3f}%'.format(mse_gain, mae_gain))
+
+        torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint_lpra.pth'))
+        print('[LPRA] saved {}'.format(os.path.join(path, 'checkpoint_lpra.pth')))
+
     def vali(self, vali_data, vali_loader, criterion, partial_train=False):
         total_loss = []
         self.model.eval()
@@ -253,6 +459,9 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
+        if self._lpra_enabled():
+            self._calibrate_lpra(train_loader, vali_loader, criterion, path)
+
         return self.model
 
     def test(self, setting, test=0):
@@ -260,7 +469,11 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             print('loading model')
-            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            checkpoint_name = 'checkpoint_lpra.pth' if self._lpra_enabled() else 'checkpoint.pth'
+            checkpoint_path = os.path.join('./checkpoints/' + setting, checkpoint_name)
+            if self._lpra_enabled() and not os.path.exists(checkpoint_path):
+                raise FileNotFoundError('LPRA checkpoint not found: ' + checkpoint_path)
+            self.model.load_state_dict(torch.load(checkpoint_path))
 
         preds = []
         trues = []
@@ -311,6 +524,10 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                     else:
                         # directly test the trained model on all variates without fine-tuning.
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                if self._lpra_enabled():
+                    full_ids = self._lpra_channel_ids(n_channels=outputs.shape[-1])
+                    outputs = self._apply_lpra(outputs, full_ids, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]

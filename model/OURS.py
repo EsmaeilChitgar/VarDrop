@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from layers.Transformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import DataEmbedding_inverted
+from model.LPRA import LowRankPeriodicResidualAdapter
 import numpy as np
 
 
@@ -38,6 +39,33 @@ class Model(nn.Module):
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
         self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
+
+        # GPT3d / LPRA.  The base iTransformer path is unchanged.  Adapter
+        # construction is isolated in a forked RNG context so enabling LPRA does
+        # not perturb the initialization or dropout/shuffle RNG stream of GPT3b.
+        self.use_lpra = bool(getattr(configs, 'use_lpra', False))
+        self.lpra = None
+        self.register_buffer('lpra_alpha', torch.tensor(0.0), persistent=True)
+
+        if self.use_lpra:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(314159)
+                self.lpra = LowRankPeriodicResidualAdapter(
+                    num_channels=configs.enc_in,
+                    period=getattr(configs, 'lpra_period', 168),
+                    rank=getattr(configs, 'lpra_rank', 32),
+                )
+
+    def lpra_correction(self, channel_ids, phase_indices):
+        if not self.use_lpra or self.lpra is None:
+            raise RuntimeError('LPRA is not enabled for this model')
+        return self.lpra(channel_ids, phase_indices)
+
+    def set_lpra_alpha(self, alpha):
+        self.lpra_alpha.fill_(float(alpha))
+
+    def get_lpra_alpha(self):
+        return float(self.lpra_alpha.detach().cpu().item())
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
