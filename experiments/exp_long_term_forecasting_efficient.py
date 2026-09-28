@@ -477,6 +477,22 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
 
         preds = []
         trues = []
+
+        # Same-forward LPRA control: measure the frozen backbone output and the
+        # LPRA-corrected output from the exact same model forward pass, batch,
+        # checkpoint, and target. Only streaming error sums are kept, so this
+        # adds negligible host-memory overhead even for Traffic-720.
+        lpra_control = self._lpra_enabled()
+        base_se = 0.0
+        base_ae = 0.0
+        base_count = 0
+        lpra_checkpoint_alpha = None
+        if lpra_control:
+            lpra_checkpoint_alpha = self._model_core().get_lpra_alpha()
+            print('[LPRA TEST CONTROL] same-forward control enabled')
+            print('[LPRA TEST CONTROL] checkpoint alpha={:.9f}'.format(
+                lpra_checkpoint_alpha))
+
         folder_path = './test_results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
@@ -525,19 +541,30 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                         # directly test the trained model on all variates without fine-tuning.
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
+                base_outputs = outputs
                 if self._lpra_enabled():
                     full_ids = self._lpra_channel_ids(n_channels=outputs.shape[-1])
                     outputs = self._apply_lpra(outputs, full_ids, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                base_outputs = base_outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                 outputs = outputs.detach().cpu().numpy()
+                base_outputs = base_outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
                 if test_data.scale and self.args.inverse:
                     shape = outputs.shape
                     outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
+                    base_outputs = test_data.inverse_transform(
+                        base_outputs.squeeze(0)).reshape(shape)
                     batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
+
+                if lpra_control:
+                    base_err = base_outputs.astype(np.float64) - batch_y.astype(np.float64)
+                    base_se += np.sum(base_err * base_err)
+                    base_ae += np.sum(np.abs(base_err))
+                    base_count += base_err.size
 
                 pred = outputs
                 true = batch_y
@@ -566,6 +593,21 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
             os.makedirs(folder_path)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
+
+        if lpra_control:
+            if base_count <= 0:
+                raise RuntimeError('LPRA test control accumulated zero target elements')
+            base_mse = base_se / base_count
+            base_mae = base_ae / base_count
+            mse_gain = 100.0 * (base_mse - float(mse)) / max(base_mse, 1e-12)
+            mae_gain = 100.0 * (base_mae - float(mae)) / max(base_mae, 1e-12)
+            print('[LPRA TEST CONTROL] base(alpha=0)   MSE={:.9f} MAE={:.9f}'.format(
+                base_mse, base_mae))
+            print('[LPRA TEST CONTROL] lpra(alpha={:.6f}) MSE={:.9f} MAE={:.9f}'.format(
+                lpra_checkpoint_alpha, float(mse), float(mae)))
+            print('[LPRA TEST CONTROL] gain            MSE={:.3f}% MAE={:.3f}%'.format(
+                mse_gain, mae_gain))
+
         print('mse:{}, mae:{}'.format(mse, mae))
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")
