@@ -2,18 +2,15 @@ import argparse
 import torch
 from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from experiments.exp_long_term_forecasting_efficient import Exp_Long_Term_Forecast_Efficient
+from utils.lprc import lprc_result_setting
 import random
 import numpy as np
 
 if __name__ == '__main__':
-    fix_seed = 2023
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
-
     parser = argparse.ArgumentParser(description='iTransformer')
 
     # basic config
+    parser.add_argument('--seed', type=int, default=2023)
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
@@ -110,9 +107,41 @@ if __name__ == '__main__':
     parser.add_argument('--lpra_cal_epochs', type=int, default=1, help='frozen-backbone LPRA calibration epochs')
     parser.add_argument('--lpra_lr', type=float, default=0.005, help='LPRA calibration learning rate')
     parser.add_argument('--lpra_alpha_max', type=float, default=1.25, help='maximum validation shrinkage alpha')
+
+    # LPRC: closed-form post-training residual correction
+    parser.add_argument('--use_lprc', action='store_true', help='apply a standalone LPRC artifact')
+    parser.add_argument('--fit_lprc', action='store_true', help='fit LPRC from TRAIN before applying it')
+    parser.add_argument('--lprc_rank', type=int, default=32, help='explicit LPRC truncated-SVD rank')
+    parser.add_argument('--lprc_period', type=int, default=168, help='LPRC periodic phase count')
+    parser.add_argument('--lprc_phase_mode', type=str, default='hour_of_week', help='LPRC phase mode; currently hour_of_week only')
+    parser.add_argument('--lprc_alpha', type=float, default=1.0, help='LPRC alpha; values other than 1.0 are ablations')
+    parser.add_argument('--lprc_checkpoint', type=str, default=None, help='explicit backbone checkpoint path for LPRC')
+    parser.add_argument('--lprc_artifact', type=str, default=None, help='explicit LPRC artifact path')
+    parser.add_argument('--lprc_save_full_arrays', action='store_true', help='also save aligned base_pred.npy for LPRC evaluation')
     
 
     args = parser.parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if args.fit_lprc and not args.use_lprc:
+        parser.error('--fit_lprc requires --use_lprc')
+    if args.use_lprc and args.use_lpra:
+        parser.error('LPRA and LPRC cannot be combined in this development stage')
+    if args.use_lprc and args.model not in ('OURS', 'iTransformer'):
+        parser.error('LPRC is currently integrated only for OURS and iTransformer')
+    if args.is_training and args.use_lprc and args.lprc_checkpoint:
+        parser.error('--lprc_checkpoint is for evaluation-only post-training use')
+    if args.use_lprc and args.lprc_phase_mode != 'hour_of_week':
+        parser.error('Only --lprc_phase_mode hour_of_week is currently implemented')
+    if args.use_lprc and args.lprc_rank <= 0:
+        parser.error('--lprc_rank must be positive')
+    if args.use_lprc and args.lprc_period <= 0:
+        parser.error('--lprc_period must be positive')
+    if args.use_lprc and args.lprc_alpha != 1.0:
+        print('[LPRC] alpha={} is an explicit ablation; main-method alpha is 1.0'.format(
+            args.lprc_alpha
+        ))
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -165,12 +194,26 @@ if __name__ == '__main__':
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
 
-            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting)
+            result_setting = setting
+            if args.use_lprc:
+                if args.fit_lprc:
+                    exp.fit_lprc(setting)
+                else:
+                    exp.load_lprc(setting)
+                result_setting = lprc_result_setting(setting, args)
+
+            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(result_setting))
+            if args.use_lprc:
+                exp.test(setting, test=1, result_setting=result_setting)
+            else:
+                exp.test(setting)
 
             if args.do_predict:
-                print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-                exp.predict(setting, True)
+                print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(result_setting))
+                if args.use_lprc:
+                    exp.predict(setting, True, result_setting=result_setting)
+                else:
+                    exp.predict(setting, True)
 
             torch.cuda.empty_cache()
     else:
@@ -202,6 +245,16 @@ if __name__ == '__main__':
             setting += '_lpra_r{}_p{}'.format(args.lpra_rank, args.lpra_period)
 
         exp = Exp(args)  # set experiments
-        print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-        exp.test(setting, test=1)
+        result_setting = setting
+        if args.use_lprc:
+            if args.fit_lprc:
+                exp.fit_lprc(setting)
+            else:
+                exp.load_lprc(setting)
+            result_setting = lprc_result_setting(setting, args)
+        print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(result_setting))
+        if args.use_lprc:
+            exp.test(setting, test=1, result_setting=result_setting)
+        else:
+            exp.test(setting, test=1)
         torch.cuda.empty_cache()

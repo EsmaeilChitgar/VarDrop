@@ -2,6 +2,7 @@ from data_provider.data_factory import data_provider
 from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
+from utils.lprc import LPRCExperimentMixin, PairedErrorAccumulator
 import torch
 import torch.nn as nn
 from torch import optim
@@ -19,9 +20,10 @@ sys.path.append('..')
 from VarDrop import efficient_sampler, ExactFastVarDropSampler
 
 
-class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
+class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast_Efficient, self).__init__(args)
+        self._initialize_lprc()
 
         # GPT3b: exact fast k-DFH. No caching or approximation.
         self.exact_fast_vardrop = bool(
@@ -55,6 +57,64 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
     def _select_criterion(self):
         criterion = nn.MSELoss()
         return criterion
+
+    def _lprc_forward_batch(self, batch):
+        """Full-channel backbone inference for TRAIN-only LPRC fitting."""
+        batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+        if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+            batch_x_mark = None
+            batch_y_mark = None
+        else:
+            batch_x_mark = batch_x_mark.float().to(self.device)
+            batch_y_mark = batch_y_mark.float().to(self.device)
+
+        dec_inp = torch.zeros_like(
+            batch_y[:, -self.args.pred_len:, :]
+        ).float()
+        dec_inp = torch.cat(
+            [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
+        ).float().to(self.device)
+
+        if self.args.use_amp:
+            with torch.cuda.amp.autocast():
+                if self.args.output_attention:
+                    outputs = self.model(
+                        batch_x, batch_x_mark, dec_inp, batch_y_mark
+                    )[0]
+                else:
+                    outputs = self.model(
+                        batch_x, batch_x_mark, dec_inp, batch_y_mark
+                    )
+        elif self.args.output_attention:
+            outputs = self.model(
+                batch_x, batch_x_mark, dec_inp, batch_y_mark
+            )[0]
+        elif self.args.channel_independence:
+            B, Tx, N = batch_x.shape
+            _, Ty, _ = dec_inp.shape
+            if batch_x_mark is None:
+                outputs = self.model(
+                    batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
+                    batch_x_mark,
+                    dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
+                    batch_y_mark,
+                ).reshape(B, N, -1).permute(0, 2, 1)
+            else:
+                outputs = self.model(
+                    batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
+                    batch_x_mark.repeat(N, 1, 1),
+                    dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
+                    batch_y_mark.repeat(N, 1, 1),
+                ).reshape(B, N, -1).permute(0, 2, 1)
+        else:
+            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+        f_dim = -1 if self.args.features == 'MS' else 0
+        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+        targets = batch_y[:, -self.args.pred_len:, f_dim:]
+        return outputs, targets, batch_y_mark
 
     def _model_core(self):
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -464,22 +524,38 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
 
         return self.model
 
-    def test(self, setting, test=0):
+    def test(self, setting, test=0, result_setting=None):
 
         test_data, test_loader = self._get_data(flag='test')
+        output_setting = setting if result_setting is None else result_setting
         if test:
             print('loading model')
-            checkpoint_name = 'checkpoint_lpra.pth' if self._lpra_enabled() else 'checkpoint.pth'
-            checkpoint_path = os.path.join('./checkpoints/' + setting, checkpoint_name)
-            if self._lpra_enabled() and not os.path.exists(checkpoint_path):
-                raise FileNotFoundError('LPRA checkpoint not found: ' + checkpoint_path)
-            self.model.load_state_dict(torch.load(checkpoint_path))
+            if self._lprc_enabled():
+                self._load_lprc_backbone(setting)
+            else:
+                checkpoint_name = 'checkpoint_lpra.pth' if self._lpra_enabled() else 'checkpoint.pth'
+                checkpoint_path = os.path.join('./checkpoints/' + setting, checkpoint_name)
+                if self._lpra_enabled() and not os.path.exists(checkpoint_path):
+                    raise FileNotFoundError('LPRA checkpoint not found: ' + checkpoint_path)
+                self.model.load_state_dict(torch.load(checkpoint_path))
+        if self._lprc_enabled() and self.lprc_artifact is None:
+            self.load_lprc(setting)
 
         preds = []
         trues = []
-        folder_path = './test_results/' + setting + '/'
+        base_preds = [] if (
+            self._lprc_enabled()
+            and getattr(self.args, 'lprc_save_full_arrays', False)
+        ) else None
+        paired_errors = PairedErrorAccumulator() if self._lprc_enabled() else None
+        lprc_apply_time = 0.0
+        folder_path = './test_results/' + output_setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
+        if self._lprc_enabled():
+            self._guard_lprc_evaluation_outputs(
+                './results/' + output_setting + '/'
+            )
 
         self.model.eval()
         with torch.no_grad():
@@ -532,15 +608,30 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                if self._lprc_enabled():
+                    base_outputs = outputs
+                    apply_start = time.perf_counter()
+                    outputs = self._apply_lprc(outputs, batch_y_mark)
+                    lprc_apply_time += time.perf_counter() - apply_start
+                    base_outputs = base_outputs.detach().cpu().numpy()
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
                 if test_data.scale and self.args.inverse:
                     shape = outputs.shape
                     outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
                     batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
+                    if self._lprc_enabled():
+                        base_outputs = test_data.inverse_transform(
+                            base_outputs.squeeze(0)
+                        ).reshape(shape)
 
                 pred = outputs
                 true = batch_y
+
+                if self._lprc_enabled():
+                    paired_errors.update(base_outputs, pred, true)
+                    if base_preds is not None:
+                        base_preds.append(base_outputs)
 
                 preds.append(pred)
                 trues.append(true)
@@ -561,14 +652,14 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         print('test shape:', preds.shape, trues.shape)
 
         # result save
-        folder_path = './results/' + setting + '/'
+        folder_path = './results/' + output_setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
         f = open("result_long_term_forecast.txt", 'a')
-        f.write(setting + "  \n")
+        f.write(output_setting + "  \n")
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
         f.write('\n')
@@ -578,15 +669,45 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
 
+        if self._lprc_enabled():
+            saved_base_predictions = base_preds is not None
+            if saved_base_predictions:
+                base_preds = np.array(base_preds)
+                base_preds = base_preds.reshape(
+                    -1, base_preds.shape[-2], base_preds.shape[-1]
+                )
+                np.save(folder_path + 'base_pred.npy', base_preds)
+            self._write_lprc_evaluation(
+                output_dir=folder_path,
+                paired_accumulator=paired_errors,
+                apply_time_sec=lprc_apply_time,
+                saved_base_predictions=saved_base_predictions,
+            )
+
         return
 
-    def predict(self, setting, load=False):
+    def predict(self, setting, load=False, result_setting=None):
         pred_data, pred_loader = self._get_data(flag='pred')
+        output_setting = setting if result_setting is None else result_setting
+        if self._lprc_enabled():
+            prediction_path = os.path.join(
+                './results/', output_setting, 'real_prediction.npy'
+            )
+            if os.path.exists(prediction_path):
+                raise FileExistsError(
+                    'Refusing to overwrite existing LPRC prediction evidence: '
+                    + prediction_path
+                )
 
         if load:
-            path = os.path.join(self.args.checkpoints, setting)
-            best_model_path = path + '/' + 'checkpoint.pth'
-            self.model.load_state_dict(torch.load(best_model_path))
+            if self._lprc_enabled():
+                self._load_lprc_backbone(setting)
+            else:
+                path = os.path.join(self.args.checkpoints, setting)
+                best_model_path = path + '/' + 'checkpoint.pth'
+                self.model.load_state_dict(torch.load(best_model_path))
+        if self._lprc_enabled() and self.lprc_artifact is None:
+            self.load_lprc(setting)
 
         preds = []
 
@@ -613,6 +734,18 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                if self._lprc_enabled():
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    corrected = self._apply_lprc(
+                        outputs[:, -self.args.pred_len:, f_dim:], batch_y_mark
+                    )
+                    if f_dim == 0:
+                        outputs = corrected
+                    else:
+                        outputs = torch.cat(
+                            [outputs[:, -self.args.pred_len:, :f_dim], corrected],
+                            dim=-1,
+                        )
                 outputs = outputs.detach().cpu().numpy()
                 if pred_data.scale and self.args.inverse:
                     shape = outputs.shape
@@ -623,7 +756,7 @@ class Exp_Long_Term_Forecast_Efficient(Exp_Basic):
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
 
         # result save
-        folder_path = './results/' + setting + '/'
+        folder_path = './results/' + output_setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
