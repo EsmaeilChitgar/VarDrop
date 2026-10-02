@@ -39,3 +39,75 @@ re-read whole files.
 After big code changes, refresh the graph with `graft build` (deterministic,
 no API key, $0).
 <!-- graft:end -->
+
+
+## Repository modification rules
+
+- Treat all existing branches as protected history.
+- Never modify, rewrite, rebase, reset, force-push, delete, or otherwise alter any pre-existing branch unless the user explicitly requests it.
+- Work only on the branch that the user explicitly selects for the current task.
+- If the user later creates or selects another branch, switch to that branch and apply all new changes there. Previous branches must remain unchanged.
+- Never merge changes into another branch unless explicitly requested.
+- Never create a new branch unless explicitly requested by the user.
+
+## Before changing code
+
+- Read this `AGENTS.md` first.
+- Use Graft before broad source-code inspection to understand the relevant subsystem, implementation, callers, and blast radius.
+- Prefer:
+  - `graft map` for repository orientation.
+  - `graft ask "<question>" --source` for understanding implementation.
+  - `graft callers <symbol>` for call relationships.
+  - `graft skeleton <file>` for API/file structure.
+  - `graft grep "<literal>"` when exhaustive matching is required.
+- After using Graft, inspect only the source ranges/files needed for the task.
+- Before editing, identify which files must change and which behavior must remain unchanged.
+
+## Code-change policy
+
+- Make the smallest change that correctly implements the requested behavior.
+- Do not refactor unrelated code.
+- Do not rename, move, reformat, or clean up unrelated files.
+- Do not change existing experiment behavior, baseline semantics, random-number behavior, dataset handling, training configuration, evaluation logic, or defaults unless the requested task explicitly requires it.
+- Preserve backward compatibility whenever practical.
+- New experimental behavior should preferably be opt-in and should not silently change the original VarDrop execution path.
+- Keep research/diagnostic functionality separate from the original baseline path when possible.
+- Do not remove existing diagnostics, logging, measurements, or experimental functionality merely because they are not part of the current main method.
+- Existing experimental code may be isolated or disabled from the main execution path when appropriate, but must not be deleted without explicit approval.
+
+## Reproducibility and regression safety
+
+- Changes must not silently alter existing results.
+- When modifying shared training, sampling, data-loading, inference, or evaluation code, add or run appropriate regression/parity checks.
+- When an optimized implementation is intended to be mathematically or semantically equivalent to an existing implementation, explicitly verify equivalence.
+- Prefer checkpoint-based or lightweight regression tests before requesting expensive retraining.
+- Do not launch large or expensive experiment sweeps unless explicitly requested.
+- Do not introduce new random seeds, repeated runs, or additional training runs unless explicitly requested.
+
+## Experiment logs and reports
+
+- Raw experiment reports are stored under `report/`.
+- Treat existing files under `report/` as immutable experimental evidence.
+- Never delete, overwrite, truncate, rename, or modify an existing report unless explicitly requested.
+- New runs must create new report files rather than replacing previous reports.
+- Preserve detailed logs needed for later paper analysis, plotting, statistical analysis, timing analysis, and reproducibility.
+- Do not reduce logging simply to make output cleaner.
+- For performance benchmarking, measurement-specific logging may be isolated from timed regions so logging overhead does not corrupt timing results.
+- Graft is for source-code understanding; raw `.txt` experiment reports should be searched/read directly with normal file tools or `rg`.
+
+## Validation after changes
+
+After making code changes:
+
+1. Review the complete diff.
+2. Confirm that only intended files and behaviors changed.
+3. Run relevant lightweight tests or sanity checks.
+4. Run regression/parity checks when shared behavior was touched.
+5. Report:
+   - files changed,
+   - behavior changed,
+   - behavior intentionally preserved,
+   - tests performed,
+   - any remaining risks or assumptions.
+
+Do not proceed to expensive experiments until the code-change and regression checks pass.
