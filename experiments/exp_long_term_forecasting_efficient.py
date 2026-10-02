@@ -2,7 +2,11 @@ from data_provider.data_factory import data_provider
 from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-from utils.lprc import LPRCExperimentMixin, PairedErrorAccumulator
+from utils.lprc import (
+    LPRCExperimentMixin,
+    PairedErrorAccumulator,
+    load_backbone_checkpoint,
+)
 import torch
 import torch.nn as nn
 from torch import optim
@@ -537,7 +541,14 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
                 checkpoint_path = os.path.join('./checkpoints/' + setting, checkpoint_name)
                 if self._lpra_enabled() and not os.path.exists(checkpoint_path):
                     raise FileNotFoundError('LPRA checkpoint not found: ' + checkpoint_path)
-                self.model.load_state_dict(torch.load(checkpoint_path))
+                if self._lpra_enabled():
+                    self.model.load_state_dict(torch.load(checkpoint_path))
+                else:
+                    load_backbone_checkpoint(
+                        self.model,
+                        checkpoint_path,
+                        allow_missing_lpra_alpha=True,
+                    )
         if self._lprc_enabled() and self.lprc_artifact is None:
             self.load_lprc(setting)
 
@@ -705,7 +716,14 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
             else:
                 path = os.path.join(self.args.checkpoints, setting)
                 best_model_path = path + '/' + 'checkpoint.pth'
-                self.model.load_state_dict(torch.load(best_model_path))
+                if self._lpra_enabled():
+                    self.model.load_state_dict(torch.load(best_model_path))
+                else:
+                    load_backbone_checkpoint(
+                        self.model,
+                        best_model_path,
+                        allow_missing_lpra_alpha=True,
+                    )
         if self._lprc_enabled() and self.lprc_artifact is None:
             self.load_lprc(setting)
 
