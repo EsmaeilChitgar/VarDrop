@@ -107,6 +107,7 @@ if __name__ == '__main__':
     parser.add_argument('--lpra_cal_epochs', type=int, default=1, help='frozen-backbone LPRA calibration epochs')
     parser.add_argument('--lpra_lr', type=float, default=0.005, help='LPRA calibration learning rate')
     parser.add_argument('--lpra_alpha_max', type=float, default=1.25, help='maximum validation shrinkage alpha')
+    parser.add_argument('--lpra_test_control', action='store_true', help='report same-forward base-vs-LPRA test metrics')
 
     # LPRC: closed-form post-training residual correction
     parser.add_argument('--use_lprc', action='store_true', help='apply a standalone LPRC artifact')

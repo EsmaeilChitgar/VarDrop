@@ -560,6 +560,15 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
         ) else None
         paired_errors = PairedErrorAccumulator() if self._lprc_enabled() else None
         lprc_apply_time = 0.0
+        lpra_test_control = (
+            self._lpra_enabled()
+            and bool(getattr(self.args, 'lpra_test_control', False))
+        )
+        if lpra_test_control:
+            lpra_control_alpha = self._model_core().get_lpra_alpha()
+            lpra_base_se = 0.0
+            lpra_base_ae = 0.0
+            lpra_base_count = 0
         folder_path = './test_results/' + output_setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
@@ -613,11 +622,17 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 if self._lpra_enabled():
+                    if lpra_test_control:
+                        lpra_base_outputs = outputs
                     full_ids = self._lpra_channel_ids(n_channels=outputs.shape[-1])
                     outputs = self._apply_lpra(outputs, full_ids, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                if lpra_test_control:
+                    lpra_base_outputs = lpra_base_outputs[
+                        :, -self.args.pred_len:, f_dim:
+                    ].detach().cpu().numpy()
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                 if self._lprc_enabled():
                     base_outputs = outputs
@@ -635,9 +650,22 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
                         base_outputs = test_data.inverse_transform(
                             base_outputs.squeeze(0)
                         ).reshape(shape)
+                    if lpra_test_control:
+                        lpra_base_outputs = test_data.inverse_transform(
+                            lpra_base_outputs.squeeze(0)
+                        ).reshape(shape)
 
                 pred = outputs
                 true = batch_y
+
+                if lpra_test_control:
+                    lpra_base_error = (
+                        lpra_base_outputs.astype(np.float64)
+                        - true.astype(np.float64)
+                    )
+                    lpra_base_se += np.sum(lpra_base_error * lpra_base_error)
+                    lpra_base_ae += np.sum(np.abs(lpra_base_error))
+                    lpra_base_count += lpra_base_error.size
 
                 if self._lprc_enabled():
                     paired_errors.update(base_outputs, pred, true)
@@ -668,6 +696,34 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
             os.makedirs(folder_path)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
+        if lpra_test_control:
+            if lpra_base_count == 0:
+                raise RuntimeError(
+                    'LPRA test control accumulated zero target elements.'
+                )
+            lpra_base_mse = lpra_base_se / lpra_base_count
+            lpra_base_mae = lpra_base_ae / lpra_base_count
+            lpra_mse_gain = 100.0 * (
+                lpra_base_mse - float(mse)
+            ) / max(lpra_base_mse, 1e-12)
+            lpra_mae_gain = 100.0 * (
+                lpra_base_mae - float(mae)
+            ) / max(lpra_base_mae, 1e-12)
+            print(
+                '[LPRA TEST CONTROL] base(alpha=0) MSE={:.9f} MAE={:.9f}'.format(
+                    lpra_base_mse, lpra_base_mae
+                )
+            )
+            print(
+                '[LPRA TEST CONTROL] lpra(alpha={:.6f}) MSE={:.9f} MAE={:.9f}'.format(
+                    lpra_control_alpha, float(mse), float(mae)
+                )
+            )
+            print(
+                '[LPRA TEST CONTROL] gain MSE={:.3f}% MAE={:.3f}%'.format(
+                    lpra_mse_gain, lpra_mae_gain
+                )
+            )
         print('mse:{}, mae:{}'.format(mse, mae))
         f = open("result_long_term_forecast.txt", 'a')
         f.write(output_setting + "  \n")
