@@ -6,6 +6,7 @@ from utils.lprc import (
     LPRCExperimentMixin,
     PairedErrorAccumulator,
     load_backbone_checkpoint,
+    lprc_result_setting,
 )
 import torch
 import torch.nn as nn
@@ -523,6 +524,9 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
+        if bool(getattr(self.args, 'lprc_export_cache_after_train', False)):
+            self.export_lprc_cache(setting)
+
         if self._lpra_enabled():
             self._calibrate_lpra(train_loader, vali_loader, criterion, path)
 
@@ -530,6 +534,12 @@ class Exp_Long_Term_Forecast_Efficient(LPRCExperimentMixin, Exp_Basic):
 
     def test(self, setting, test=0, result_setting=None):
 
+        if self._final_lprc_enabled():
+            return self._test_final_lprc(
+                setting,
+                test,
+                result_setting or lprc_result_setting(setting, self.args),
+            )
         test_data, test_loader = self._get_data(flag='test')
         output_setting = setting if result_setting is None else result_setting
         if test:

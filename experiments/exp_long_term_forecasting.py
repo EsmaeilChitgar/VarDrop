@@ -2,7 +2,11 @@ from data_provider.data_factory import data_provider
 from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-from utils.lprc import LPRCExperimentMixin, PairedErrorAccumulator
+from utils.lprc import (
+    LPRCExperimentMixin,
+    PairedErrorAccumulator,
+    lprc_result_setting,
+)
 import torch
 import torch.nn as nn
 from torch import optim
@@ -228,9 +232,18 @@ class Exp_Long_Term_Forecast(LPRCExperimentMixin, Exp_Basic):
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
+        if bool(getattr(self.args, 'lprc_export_cache_after_train', False)):
+            self.export_lprc_cache(setting)
+
         return self.model
 
     def test(self, setting, test=0, result_setting=None):
+        if self._final_lprc_enabled():
+            return self._test_final_lprc(
+                setting,
+                test,
+                result_setting or lprc_result_setting(setting, self.args),
+            )
         test_data, test_loader = self._get_data(flag='test')
         output_setting = setting if result_setting is None else result_setting
         if test:

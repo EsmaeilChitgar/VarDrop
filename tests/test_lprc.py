@@ -1,12 +1,16 @@
 import os
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from data_provider.data_loader import Dataset_Custom, Dataset_PEMS
+from run import experiment_setting
 from VarDrop import (
     efficient_sampler,
     efficient_sampler_fast_exact,
@@ -19,10 +23,19 @@ from utils.lprc import (
     ResidualTableAccumulator,
     apply_lprc,
     build_lprc_artifact,
+    CompactResidualAccumulator,
+    LPRCExperimentMixin,
+    StreamingVariantMetrics,
+    fit_final_lprc,
+    fit_lprc_from_cache,
     fit_lprc_artifact,
+    forecast_target_global_offsets,
     guard_lprc_evaluation_output_dir,
     load_backbone_checkpoint,
     load_lprc_artifact,
+    load_final_lprc_artifact,
+    lprc_result_setting,
+    lprc_setting_suffix,
     make_phase_indexer,
     model_config_from_args,
     phase_indexer_from_args,
@@ -30,6 +43,7 @@ from utils.lprc import (
     save_lprc_artifact,
     sha256_file,
     truncated_svd,
+    validate_lprc_cache_metadata,
 )
 
 
@@ -104,6 +118,27 @@ class TinyModel(torch.nn.Module):
 
     def forward(self, values):
         return values * self.weight
+
+
+def periodic_cache(period=12, channels=4, train_length=240, val_length=96):
+    phase_pattern = np.stack([
+        np.sin(2.0 * np.pi * np.arange(period) / period + channel)
+        for channel in range(channels)
+    ], axis=1)
+    train = phase_pattern[np.arange(train_length) % period]
+    val = phase_pattern[(train_length + np.arange(val_length)) % period]
+    return {
+        'metadata': {
+            'train_global_offset': 0,
+            'val_global_offset': train_length,
+            'test_global_offset': train_length + val_length,
+        },
+        'train_residual_sum': train,
+        'train_count': np.ones(train_length, dtype=np.int64),
+        'val_residual_sum': val,
+        'val_residual_sumsq': val ** 2,
+        'val_count': np.ones(val_length, dtype=np.int64),
+    }
 
 
 class TestLPRC(unittest.TestCase):
@@ -401,6 +436,236 @@ class TestLPRC(unittest.TestCase):
                 observations,
                 [{'grad_enabled': False, 'model_training': False}],
             )
+
+    def test_final_fit_uses_one_selected_period_svd(self):
+        cache = periodic_cache()
+        with mock.patch(
+            'utils.lprc.np.linalg.svd', wraps=np.linalg.svd
+        ) as svd:
+            fit = fit_final_lprc(cache)
+        self.assertEqual(fit['selected_period'], 12)
+        self.assertEqual(svd.call_count, 1)
+        self.assertIn('tau=.90', fit['variants'])
+        self.assertIn('selected-P full rank', fit['variants'])
+        self.assertIn('P=1', fit['variants'])
+
+    def test_cache_metadata_rejects_explicit_use_norm_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = make_args(temp_dir)
+            args.exact_fast_vardrop = True
+            args.k = 4
+            args.group_size = 10
+            metadata = {
+                'checkpoint_sha256': 'a' * 64,
+                'dataset': args.data,
+                'data_path': args.data_path,
+                'seq_len': args.seq_len,
+                'pred_len': args.pred_len,
+                'channels': args.enc_in,
+                'use_norm': 0,
+                'k': args.k,
+                'group_size': args.group_size,
+                'exact_fast_vardrop': True,
+                'cache_version': 1,
+                'train_global_offset': 0,
+                'val_global_offset': 240,
+                'test_global_offset': 336,
+            }
+            with self.assertRaisesRegex(RuntimeError, 'use_norm'):
+                validate_lprc_cache_metadata(metadata, args)
+
+    def test_fit_from_cache_is_numpy_only_and_artifact_is_low_rank(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = make_args(temp_dir)
+            args.exact_fast_vardrop = True
+            args.k = 4
+            args.group_size = 10
+            args.checkpoints = temp_dir
+            args.seed = 2023
+            cache = periodic_cache(channels=2)
+            metadata = {
+                'checkpoint_sha256': 'b' * 64,
+                'dataset': args.data,
+                'data_path': args.data_path,
+                'seq_len': args.seq_len,
+                'pred_len': args.pred_len,
+                'channels': args.enc_in,
+                'use_norm': args.use_norm,
+                'k': args.k,
+                'group_size': args.group_size,
+                'exact_fast_vardrop': True,
+                'cache_version': 1,
+                **cache['metadata'],
+            }
+            cache_path = os.path.join(temp_dir, 'cache.npz')
+            artifact_path = os.path.join(temp_dir, 'artifact.npz')
+            np.savez_compressed(
+                cache_path,
+                metadata_json=np.asarray(json.dumps(metadata)),
+                train_residual_sum=cache['train_residual_sum'],
+                train_residual_sumsq=cache['train_residual_sum'] ** 2,
+                train_count=cache['train_count'],
+                val_residual_sum=cache['val_residual_sum'],
+                val_residual_sumsq=cache['val_residual_sumsq'],
+                val_count=cache['val_count'],
+            )
+            with mock.patch('utils.lprc.torch.load') as torch_load, mock.patch(
+                'utils.lprc.torch.cuda.is_available'
+            ) as cuda_available:
+                fitted = fit_lprc_from_cache(
+                    cache_path,
+                    artifact_path,
+                    args,
+                    'synthetic_xf1_lp1_pa_w1_t95',
+                )
+            torch_load.assert_not_called()
+            cuda_available.assert_not_called()
+            self.assertIn(fitted['selected_P'], (12, 24))
+            artifact = load_final_lprc_artifact(artifact_path)
+            self.assertEqual(
+                artifact['phase_factor'].shape[1], fitted['selected_rank']
+            )
+            with np.load(artifact_path, allow_pickle=False) as stored:
+                self.assertNotIn('residual_table', stored.files)
+                self.assertNotIn('train_residual_sum', stored.files)
+                self.assertIn('phase_factor', stored.files)
+                self.assertIn('variable_factor', stored.files)
+
+    def test_short_setting_suffixes(self):
+        self.assertEqual(
+            lprc_setting_suffix(True, True), '_xf1_lp1_pa_w1_t95'
+        )
+        args = SimpleNamespace(exact_fast_vardrop=True)
+        self.assertEqual(
+            lprc_result_setting('run_fastdfh', args),
+            'run_xf1_lp1_pa_w1_t95',
+        )
+
+    def test_historical_exact_fast_backbone_setting_is_unchanged(self):
+        args = SimpleNamespace(
+            model_id='traffic_96_96', model='OURS', data='custom',
+            features='M', seq_len=96, label_len=48, pred_len=96,
+            d_model=512, n_heads=8, e_layers=2, d_layers=1, d_ff=2048,
+            factor=3, embed='timeF', distil=True, des='Exp', k=4,
+            group_size=10, class_strategy='projection',
+            exact_fast_vardrop=True, use_lpra=False,
+        )
+        self.assertEqual(
+            experiment_setting(args, 0),
+            'traffic_96_96_OURS_custom_M_ft96_sl48_ll96_pl512_dm8_nh2_'
+            'el1_dl2048_df3_fctimeF_ebTrue_dtExp_k4_gs10_projection_0_'
+            'fastdfh',
+        )
+
+    def test_custom_overlapping_split_target_alignment(self):
+        train_data = Dataset_Custom.__new__(Dataset_Custom)
+        val_data = Dataset_Custom.__new__(Dataset_Custom)
+        train_data.data_x = np.empty((70, 1))
+        val_data.data_x = np.empty((14, 1))
+        self.assertEqual(
+            forecast_target_global_offsets(train_data, val_data, 4),
+            {'train': 4, 'val': 70, 'test': 80},
+        )
+
+    def test_pems_disjoint_split_target_alignment(self):
+        train_data = Dataset_PEMS.__new__(Dataset_PEMS)
+        val_data = Dataset_PEMS.__new__(Dataset_PEMS)
+        train_data.data_x = np.empty((60, 1))
+        val_data.data_x = np.empty((20, 1))
+        self.assertEqual(
+            forecast_target_global_offsets(train_data, val_data, 4),
+            {'train': 4, 'val': 64, 'test': 84},
+        )
+
+    def test_final_ablation_evaluation_is_one_streaming_pass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = make_args(temp_dir)
+            args.seed = 2023
+            args.checkpoints = temp_dir
+            args.exact_fast_vardrop = True
+            args.k = 4
+            args.group_size = 10
+            args.inverse = False
+            args.lprc_eval_ablations = True
+
+            metadata = {
+                'selected_P': 2,
+                'selected_rank': 1,
+                'channels': 2,
+                'checkpoint_sha256': 'c' * 64,
+                'cache_version': 1,
+                'artifact_version': 3,
+                'test_global_offset': 4,
+                'variant_periods': {
+                    'P=1': 1,
+                    'selected-P full rank': 2,
+                    'tau=.90': 2,
+                    'tau=.95': 2,
+                    'tau=.97': 2,
+                },
+            }
+            one_phase = np.ones((2, 1), dtype=np.float64) * 0.25
+            variable = np.ones((1, 2), dtype=np.float64)
+
+            class FinalHarness(LPRCExperimentMixin):
+                def __init__(self):
+                    self.args = args
+                    self.model = TinyModel()
+                    self.device = torch.device('cpu')
+                    self.calls = 0
+                    self.loader_calls = 0
+                    self.lprc_artifact_path = os.path.join(
+                        temp_dir, 'artifact.npz'
+                    )
+                    self.lprc_artifact = {
+                        'metadata': metadata,
+                        'phase_factor': one_phase,
+                        'variable_factor': variable,
+                        'variants': {
+                            label: (one_phase[:period], variable)
+                            for label, period in (
+                                ('P=1', 1),
+                                ('selected-P full rank', 2),
+                                ('tau=.90', 2),
+                                ('tau=.95', 2),
+                                ('tau=.97', 2),
+                            )
+                        },
+                    }
+
+                def _get_data(self, flag):
+                    self.loader_calls += 1
+                    self.assert_flag = flag
+                    return SimpleNamespace(scale=False), [0, 1, 2]
+
+                def _lprc_forward_batch(self, batch):
+                    self.calls += 1
+                    return (
+                        torch.zeros(2, 3, 2),
+                        torch.ones(2, 3, 2),
+                        None,
+                    )
+
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                harness = FinalHarness()
+                record = harness._test_final_lprc(
+                    'backbone_xf1_lp0', 0, 'run_xf1_lp1_pa_w1_t95'
+                )
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(harness.assert_flag, 'test')
+            self.assertEqual(harness.loader_calls, 1)
+            self.assertEqual(harness.calls, 3)
+            self.assertEqual(record['test_model_passes'], 1)
+            saved = []
+            for root, _, files in os.walk(temp_dir):
+                saved.extend(os.path.join(root, name) for name in files)
+            self.assertFalse(any(
+                os.path.basename(path) in ('pred.npy', 'true.npy', 'base_pred.npy')
+                for path in saved
+            ))
 
 
 if __name__ == '__main__':

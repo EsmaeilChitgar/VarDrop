@@ -1,10 +1,43 @@
 import argparse
 import torch
-from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
-from experiments.exp_long_term_forecasting_efficient import Exp_Long_Term_Forecast_Efficient
-from utils.lprc import lprc_result_setting
+import os
+from utils.lprc import (
+    default_final_lprc_artifact_path,
+    default_lprc_cache_path,
+    ensure_safe_windows_path,
+    fit_lprc_from_cache,
+    lprc_result_setting,
+)
 import random
 import numpy as np
+
+
+def experiment_setting(args, iteration):
+    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_{}_{}'.format(
+        args.model_id, args.model, args.data, args.features, args.seq_len,
+        args.label_len, args.pred_len, args.d_model, args.n_heads,
+        args.e_layers, args.d_layers, args.d_ff, args.factor, args.embed,
+        args.distil, args.des, args.k, args.group_size, args.class_strategy,
+        iteration,
+    )
+    if args.exact_fast_vardrop:
+        setting += '_fastdfh'
+    if args.use_lpra:
+        setting += '_lpra_r{}_p{}'.format(
+            args.lpra_rank, args.lpra_period
+        )
+    return setting
+
+
+def validate_setting_paths(args, setting, result_setting):
+    ensure_safe_windows_path(
+        os.path.join(args.checkpoints, setting, 'checkpoint.pth'),
+        'checkpoint',
+    )
+    ensure_safe_windows_path(
+        os.path.join('./results', result_setting, 'lprc_summary.json'),
+        'report',
+    )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='iTransformer')
@@ -111,20 +144,28 @@ if __name__ == '__main__':
 
     # LPRC: closed-form post-training residual correction
     parser.add_argument('--use_lprc', action='store_true', help='apply a standalone LPRC artifact')
-    parser.add_argument('--fit_lprc', action='store_true', help='fit LPRC from TRAIN before applying it')
-    parser.add_argument('--lprc_rank', type=int, default=32, help='explicit LPRC truncated-SVD rank')
-    parser.add_argument('--lprc_period', type=int, default=168, help='LPRC periodic phase count')
-    parser.add_argument('--lprc_phase_mode', type=str, default='hour_of_week', help='LPRC phase mode; currently hour_of_week only')
-    parser.add_argument('--lprc_alpha', type=float, default=1.0, help='LPRC alpha; values other than 1.0 are ablations')
+    parser.add_argument('--fit_lprc', action='store_true', help='legacy direct/manual LPRC fit (diagnostic compatibility)')
+    parser.add_argument('--lprc_rank', type=int, default=32, help='legacy/manual LPRC rank')
+    parser.add_argument('--lprc_period', type=int, default=168, help='legacy/manual LPRC period')
+    parser.add_argument('--lprc_phase_mode', type=str, default='hour_of_week', help='legacy/manual phase mode')
+    parser.add_argument('--lprc_alpha', type=float, default=1.0, help='legacy/manual alpha; final LPRC always uses 1')
     parser.add_argument('--lprc_checkpoint', type=str, default=None, help='explicit backbone checkpoint path for LPRC')
     parser.add_argument('--lprc_artifact', type=str, default=None, help='explicit LPRC artifact path')
-    parser.add_argument('--lprc_save_full_arrays', action='store_true', help='also save aligned base_pred.npy for LPRC evaluation')
+    parser.add_argument('--lprc_cache', type=str, default=None, help='explicit compact TRAIN/VAL LPRC cache path')
+    parser.add_argument('--lprc_export_cache', action='store_true', help='export TRAIN/VAL cache and exit without TEST')
+    parser.add_argument('--lprc_fit_from_cache', action='store_true', help='CPU/NumPy cache-to-artifact fit and exit')
+    parser.add_argument('--lprc_export_cache_after_train', action='store_true', help='export TRAIN/VAL cache after loading the best checkpoint')
+    parser.add_argument('--lprc_eval_ablations', action='store_true', help='stream all frozen LPRC ablations in the same TEST pass')
+    parser.add_argument('--lprc_save_full_arrays', action='store_true', help='legacy/manual only; final LPRC never writes full TEST arrays')
     
 
     args = parser.parse_args()
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    if args.lprc_fit_from_cache:
+        args.use_lprc = True
+    if sum(bool(value) for value in (
+        args.lprc_export_cache, args.lprc_fit_from_cache
+    )) > 1:
+        parser.error('Choose only one standalone LPRC stage.')
     if args.fit_lprc and not args.use_lprc:
         parser.error('--fit_lprc requires --use_lprc')
     if args.use_lprc and args.use_lpra:
@@ -133,16 +174,42 @@ if __name__ == '__main__':
         parser.error('LPRC is currently integrated only for OURS and iTransformer')
     if args.is_training and args.use_lprc and args.lprc_checkpoint:
         parser.error('--lprc_checkpoint is for evaluation-only post-training use')
-    if args.use_lprc and args.lprc_phase_mode != 'hour_of_week':
+    if args.fit_lprc and args.lprc_phase_mode != 'hour_of_week':
         parser.error('Only --lprc_phase_mode hour_of_week is currently implemented')
-    if args.use_lprc and args.lprc_rank <= 0:
+    if args.fit_lprc and args.lprc_rank <= 0:
         parser.error('--lprc_rank must be positive')
-    if args.use_lprc and args.lprc_period <= 0:
+    if args.fit_lprc and args.lprc_period <= 0:
         parser.error('--lprc_period must be positive')
-    if args.use_lprc and args.lprc_alpha != 1.0:
+    if args.fit_lprc and args.lprc_alpha != 1.0:
         print('[LPRC] alpha={} is an explicit ablation; main-method alpha is 1.0'.format(
             args.lprc_alpha
         ))
+    if args.use_lprc and not args.fit_lprc and not args.exact_fast_vardrop:
+        parser.error('Final LPRC requires --exact_fast_vardrop')
+    if args.do_predict and args.use_lprc and not args.fit_lprc:
+        parser.error('Final LPRC supports the frozen TEST path, not --do_predict')
+
+    if args.lprc_fit_from_cache:
+        setting = experiment_setting(args, 0)
+        result_setting = lprc_result_setting(setting, args)
+        validate_setting_paths(args, setting, result_setting)
+        cache_path = default_lprc_cache_path(args, setting)
+        artifact_path = default_final_lprc_artifact_path(args, setting)
+        metadata = fit_lprc_from_cache(
+            cache_path, artifact_path, args, result_setting
+        )
+        print(
+            '[LPRC] fitted from cache on CPU/NumPy: P={} rank={} gain={:+.3f}%'.format(
+                metadata['selected_P'],
+                metadata['selected_rank'],
+                metadata['validation_mse_gain_pct'],
+            )
+        )
+        raise SystemExit(0)
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -154,6 +221,11 @@ if __name__ == '__main__':
     print('Args in experiment:')
     print(args)
 
+    from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
+    from experiments.exp_long_term_forecasting_efficient import (
+        Exp_Long_Term_Forecast_Efficient,
+    )
+
     if args.model == 'OURS':
         print(">> Run 'Exp_Long_Term_Forecast_Efficient'.")
         Exp = Exp_Long_Term_Forecast_Efficient
@@ -161,41 +233,27 @@ if __name__ == '__main__':
         print(">> Run 'Exp_Long_Term_Forecast'")
         Exp = Exp_Long_Term_Forecast
 
+    if args.lprc_export_cache:
+        setting = experiment_setting(args, 0)
+        validate_setting_paths(args, setting, setting)
+        exp = Exp(args)
+        exp.export_lprc_cache(setting)
+        raise SystemExit(0)
+
 
     if args.is_training:
         for ii in range(args.itr):
-            # setting record of experiments
-            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_{}_{}'.format(
-                args.model_id,
-                args.model,
-                args.data,
-                args.features,
-                args.seq_len,
-                args.label_len,
-                args.pred_len,
-                args.d_model,
-                args.n_heads,
-                args.e_layers,
-                args.d_layers,
-                args.d_ff,
-                args.factor,
-                args.embed,
-                args.distil,
-                args.des,
-                args.k,
-                args.group_size,
-                args.class_strategy, ii)
-
-            if args.exact_fast_vardrop:
-                setting += '_fastdfh'
-            if args.use_lpra:
-                setting += '_lpra_r{}_p{}'.format(args.lpra_rank, args.lpra_period)
+            setting = experiment_setting(args, ii)
+            result_setting = (
+                lprc_result_setting(setting, args)
+                if args.use_lprc else setting
+            )
+            validate_setting_paths(args, setting, result_setting)
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
 
-            result_setting = setting
             if args.use_lprc:
                 if args.fit_lprc:
                     exp.fit_lprc(setting)
@@ -219,34 +277,13 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
     else:
         ii = 0
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_k{}_gs{}_{}_{}'.format(
-            args.model_id,
-            args.model,
-            args.data,
-            args.features,
-            args.seq_len,
-            args.label_len,
-            args.pred_len,
-            args.d_model,
-            args.n_heads,
-            args.e_layers,
-            args.d_layers,
-            args.d_ff,
-            args.factor,
-            args.embed,
-            args.distil,
-            args.des,
-            args.k,
-            args.group_size,
-            args.class_strategy, ii)
-
-        if args.exact_fast_vardrop:
-            setting += '_fastdfh'
-        if args.use_lpra:
-            setting += '_lpra_r{}_p{}'.format(args.lpra_rank, args.lpra_period)
+        setting = experiment_setting(args, ii)
+        result_setting = (
+            lprc_result_setting(setting, args) if args.use_lprc else setting
+        )
+        validate_setting_paths(args, setting, result_setting)
 
         exp = Exp(args)  # set experiments
-        result_setting = setting
         if args.use_lprc:
             if args.fit_lprc:
                 exp.fit_lprc(setting)
